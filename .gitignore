@@ -1,0 +1,6 @@
+node_modules/
+uploads/*
+!uploads/.gitkeep
+!uploads/sample-exam.pdf
+.env
+.DS_Store
