@@ -252,6 +252,38 @@ app.post('/api/teacher/student/force-submit', requireTeacherAuth, (req, res) => 
   res.status(404).json({ success: false, error: 'Student not found' });
 });
 
+// Teacher: Clear Inactive / Offline Students and reset stale sessions
+app.post('/api/teacher/students/clear-inactive', requireTeacherAuth, (req, res) => {
+  const activeSockets = io.sockets.sockets;
+  let removedCount = 0;
+
+  for (const socketId in students) {
+    const student = students[socketId];
+    const isSocketConnected = activeSockets && activeSockets.has(socketId);
+
+    // If socket is disconnected, offline, or not actively attached, purge it!
+    if (!isSocketConnected || student.status === 'disconnected' || student.status === 'offline') {
+      delete students[socketId];
+      removedCount++;
+    }
+  }
+
+  // Notify teacher consoles of updated roster
+  io.to('teachers_room').emit('teacher:students_update', Object.values(students));
+  io.to('teachers_room').emit('teacher:new_notification', {
+    type: 'info',
+    title: 'Roster Refreshed',
+    message: `Cleared ${removedCount} inactive/offline student session(s). Only active candidate sessions are displayed.`,
+    timestamp: new Date().toLocaleTimeString()
+  });
+
+  res.json({
+    success: true,
+    removedCount,
+    remainingCount: Object.keys(students).length
+  });
+});
+
 // ========================
 // REAL-TIME SOCKET.IO LOGIC
 // ========================
@@ -261,6 +293,19 @@ io.on('connection', (socket) => {
     socket.join('teachers_room');
     socket.emit('exam:state_sync', examState);
     socket.emit('teacher:students_update', Object.values(students));
+  });
+
+  // Teacher manually clears inactive students via socket
+  socket.on('teacher:clear_inactive', () => {
+    const activeSockets = io.sockets.sockets;
+    for (const socketId in students) {
+      const student = students[socketId];
+      const isSocketConnected = activeSockets && activeSockets.has(socketId);
+      if (!isSocketConnected || student.status === 'disconnected' || student.status === 'offline') {
+        delete students[socketId];
+      }
+    }
+    io.to('teachers_room').emit('teacher:students_update', Object.values(students));
   });
 
   // Student joining test room

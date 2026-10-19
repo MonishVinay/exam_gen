@@ -628,3 +628,37 @@ if (closeAnswersModalBtn) {
   });
 }
 
+// Refresh & Clear Inactive Students
+const refreshClearInactiveBtn = document.getElementById('refresh-clear-inactive-btn');
+const refreshIcon = document.getElementById('refresh-icon');
+
+if (refreshClearInactiveBtn) {
+  refreshClearInactiveBtn.addEventListener('click', async () => {
+    if (refreshIcon) refreshIcon.classList.add('fa-spin');
+
+    try {
+      // 1. Emit via socket for instant zero-latency purge
+      if (socket) {
+        socket.emit('teacher:clear_inactive');
+      }
+
+      // 2. Call backend API to purge inactive records
+      const res = await fetch('/api/teacher/students/clear-inactive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      const data = await res.json();
+
+      // Refresh state
+      fetchExamState();
+    } catch (err) {
+      console.error('Failed to clear inactive sessions:', err);
+    } finally {
+      setTimeout(() => {
+        if (refreshIcon) refreshIcon.classList.remove('fa-spin');
+      }, 600);
+    }
+  });
+}
+
+

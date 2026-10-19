@@ -291,7 +291,15 @@
                 </h3>
                 <p class="text-xs text-slate-400">Live fullscreen status, seconds spent outside, and student answers.</p>
               </div>
-              <div class="flex items-center space-x-3">
+              <div class="flex items-center space-x-2.5">
+                <button 
+                  id="refresh-clear-inactive-btn" 
+                  class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-semibold flex items-center space-x-1.5 transition-all shadow-sm cursor-pointer"
+                  title="Clear inactive & offline student sessions and show only active candidate logins"
+                >
+                  <i class="fa-solid fa-arrows-rotate text-xs" id="refresh-icon"></i>
+                  <span>Refresh & Clear Inactive</span>
+                </button>
                 <a 
                   href="/api/teacher/export-submissions" 
                   target="_blank" 
@@ -299,7 +307,7 @@
                   title="Download all student responses & proctoring logs as CSV"
                 >
                   <i class="fa-solid fa-file-csv text-sm"></i>
-                  <span>Export Submissions (CSV)</span>
+                  <span>Export CSV</span>
                 </a>
                 <span class="text-xs font-mono text-slate-400 bg-slate-800 px-2.5 py-1 rounded-md border border-slate-700" id="roster-count">
                   0 Connected
