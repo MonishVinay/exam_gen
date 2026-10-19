@@ -62,6 +62,17 @@ const zoomOutBtn = document.getElementById('zoom-out-btn');
 const zoomLevelText = document.getElementById('zoom-level-text');
 const studentSubmitBtn = document.getElementById('student-submit-btn');
 
+// DOM Elements - Answer Sheet Minimize / Expand Controls
+const toggleAnswersPaneBtn = document.getElementById('toggle-answers-pane-btn');
+const toggleBtnText = document.getElementById('toggle-btn-text');
+const toggleIcon = document.getElementById('toggle-icon');
+const minimizeAnswersBtn = document.getElementById('minimize-answers-btn');
+const answersPaneContainer = document.getElementById('answers-pane-container');
+const floatingOpenAnswersBtn = document.getElementById('floating-open-answers-btn');
+const floatingAnsweredCount = document.getElementById('floating-answered-count');
+const pdfViewModeHint = document.getElementById('pdf-view-mode-hint');
+let isAnswerPaneMinimized = false;
+
 // DOM Elements - Alert Overlay
 const awayTimerCounter = document.getElementById('away-timer-counter');
 const resumeFullscreenBtn = document.getElementById('resume-fullscreen-btn');
@@ -374,9 +385,57 @@ function updateAnswerProgress(totalQuestions) {
   if (answeredProgressBadge) {
     answeredProgressBadge.textContent = `${answeredCount} / ${totalQuestions} Answered`;
   }
+  if (floatingAnsweredCount) {
+    floatingAnsweredCount.textContent = `${answeredCount}/${totalQuestions}`;
+  }
 }
 
+// Toggle & Minimize Candidate Answer Response Interface
+function toggleAnswerPane() {
+  isAnswerPaneMinimized = !isAnswerPaneMinimized;
+
+  if (isAnswerPaneMinimized) {
+    // MINIMIZE ANSWER SHEET
+    if (answersPaneContainer) answersPaneContainer.classList.add('hidden');
+    if (pdfScrollContainer) {
+      pdfScrollContainer.classList.remove('md:w-3/5', 'border-r');
+      pdfScrollContainer.classList.add('w-full');
+    }
+    if (floatingOpenAnswersBtn) floatingOpenAnswersBtn.classList.remove('hidden');
+
+    if (toggleBtnText) toggleBtnText.textContent = 'Show Answers';
+    if (toggleIcon) toggleIcon.className = 'fa-solid fa-pen-to-square';
+    if (pdfViewModeHint) pdfViewModeHint.textContent = 'Expanded Full Screen View';
+  } else {
+    // EXPAND ANSWER SHEET
+    if (answersPaneContainer) answersPaneContainer.classList.remove('hidden');
+    if (pdfScrollContainer) {
+      pdfScrollContainer.classList.add('md:w-3/5', 'border-r');
+      pdfScrollContainer.classList.remove('w-full');
+    }
+    if (floatingOpenAnswersBtn) floatingOpenAnswersBtn.classList.add('hidden');
+
+    if (toggleBtnText) toggleBtnText.textContent = 'Minimize Answers';
+    if (toggleIcon) toggleIcon.className = 'fa-solid fa-table-columns';
+    if (pdfViewModeHint) pdfViewModeHint.textContent = 'Scroll down to navigate pages';
+  }
+
+  // Refresh progress count
+  const totalQuestions = currentExamState?.totalQuestions || 10;
+  updateAnswerProgress(totalQuestions);
+}
+
+// Wire up minimize/expand listeners
+if (toggleAnswersPaneBtn) toggleAnswersPaneBtn.addEventListener('click', toggleAnswerPane);
+if (minimizeAnswersBtn) minimizeAnswersBtn.addEventListener('click', toggleAnswerPane);
+if (floatingOpenAnswersBtn) floatingOpenAnswersBtn.addEventListener('click', toggleAnswerPane);
+
 window.jumpToQuestion = function(qNum) {
+  // If answers pane is currently minimized, reopen it first!
+  if (isAnswerPaneMinimized) {
+    toggleAnswerPane();
+  }
+
   const card = document.getElementById(`q-card-${qNum}`);
   if (card) {
     card.scrollIntoView({ behavior: 'smooth', block: 'center' });

@@ -557,18 +557,34 @@ function escapeHtml(text) {
 // Open Student Submitted Answers Review Modal
 window.viewStudentAnswers = async function(socketId) {
   try {
-    const res = await fetch(`/api/teacher/student-answers/${socketId}`);
-    const data = await res.json();
-    if (!data.success) {
-      alert(data.error || 'Failed to retrieve student answers.');
+    // 1. First look up the student in the real-time student list in memory
+    let student = studentsList.find(s => s.socketId === socketId);
+
+    // 2. If not found in memory, fallback to API request
+    if (!student || !student.answers) {
+      try {
+        const res = await fetch(`/api/teacher/student-answers/${socketId}`);
+        const contentType = res.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          const data = await res.json();
+          if (data && data.success && data.student) {
+            student = data.student;
+          }
+        }
+      } catch (fetchErr) {
+        console.warn('API fetch fallback error:', fetchErr);
+      }
+    }
+
+    if (!student) {
+      alert('Could not locate student submission data.');
       return;
     }
 
-    const { student } = data;
     answersModalStudentName.textContent = `${student.name}'s Answer Sheet`;
     answersModalStudentMeta.textContent = `Roll No: ${student.rollNo} • Status: ${student.status.toUpperCase()} ${student.submittedAt ? '• Submitted: ' + student.submittedAt : ''}`;
     
-    const totalQ = student.totalQuestions || 10;
+    const totalQ = currentExamState?.totalQuestions || student.totalQuestions || 10;
     answersModalCount.textContent = `${student.answeredCount || 0} / ${totalQ} answered`;
     answersModalAway.textContent = formatDuration(student.outDurationSeconds || 0);
     answersModalFlags.textContent = (student.violations || []).length;

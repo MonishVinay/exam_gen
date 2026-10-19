@@ -227,12 +227,23 @@
       </div>
 
       <!-- Right: Answer Progress, Zoom Controls & Submit Button -->
-      <div class="flex items-center space-x-3">
+      <!-- Right: Answer Progress, Zoom Controls, Toggle Answers & Submit Button -->
+      <div class="flex items-center space-x-2.5">
         <!-- Live Answer Progress Counter -->
         <div class="hidden sm:flex items-center space-x-1 px-2.5 py-1 rounded-lg bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 font-mono text-xs">
           <i class="fa-solid fa-pen-to-square text-[10px]"></i>
           <span id="answered-progress-badge">0 / 10 Answered</span>
         </div>
+
+        <!-- Toggle / Minimize Answers Pane Button -->
+        <button 
+          id="toggle-answers-pane-btn" 
+          class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-indigo-300 hover:text-white border border-slate-700 text-xs font-semibold flex items-center space-x-1.5 transition-all"
+          title="Minimize or expand candidate answer sheet"
+        >
+          <i class="fa-solid fa-table-columns" id="toggle-icon"></i>
+          <span id="toggle-btn-text" class="hidden md:inline">Minimize Answers</span>
+        </button>
 
         <div class="flex items-center bg-slate-800 rounded-lg p-0.5 border border-slate-700 text-xs">
           <button id="zoom-out-btn" class="w-7 h-7 flex items-center justify-center text-slate-300 hover:text-white hover:bg-slate-700 rounded transition-colors" title="Zoom Out PDF">
@@ -256,16 +267,16 @@
     </header>
 
     <!-- Main Workspace: Split Screen (Left: PDF Viewer | Right: Candidate Answer Sheet) -->
-    <div class="flex-1 flex flex-col md:flex-row overflow-hidden relative">
+    <div class="flex-1 flex flex-col md:flex-row overflow-hidden relative" id="workspace-container">
 
-      <!-- LEFT PANE: PDF Question Paper Viewer (60% width) -->
-      <div id="pdf-scroll-container" class="w-full md:w-3/5 h-full overflow-y-auto p-4 md:p-6 flex flex-col items-center bg-slate-900/30 border-r border-slate-800 relative">
+      <!-- LEFT PANE: PDF Question Paper Viewer (60% width by default, expands to 100% when answers minimized) -->
+      <div id="pdf-scroll-container" class="w-full md:w-3/5 h-full overflow-y-auto p-4 md:p-6 flex flex-col items-center bg-slate-900/30 border-r border-slate-800 relative transition-all duration-300">
         <div class="w-full max-w-2xl flex items-center justify-between pb-2 mb-4 border-b border-slate-800/80 text-[11px] text-slate-400">
           <span class="flex items-center space-x-1.5 font-semibold text-slate-300">
             <i class="fa-solid fa-file-pdf text-rose-400"></i>
             <span>Question Paper (PDF)</span>
           </span>
-          <span>Scroll down to navigate pages</span>
+          <span id="pdf-view-mode-hint">Scroll down to navigate pages</span>
         </div>
 
         <div id="pdf-loading-spinner" class="my-auto py-20 text-center text-slate-400 text-sm">
@@ -277,8 +288,8 @@
         <div id="pdf-pages-wrapper" class="w-full flex flex-col items-center"></div>
       </div>
 
-      <!-- RIGHT PANE: Candidate Answer Interface (40% width) -->
-      <div class="w-full md:w-2/5 h-full flex flex-col bg-slate-950/80 backdrop-blur z-20">
+      <!-- RIGHT PANE: Candidate Answer Interface (40% width, can be minimized) -->
+      <div id="answers-pane-container" class="w-full md:w-2/5 h-full flex flex-col bg-slate-950/80 backdrop-blur z-20 transition-all duration-300">
         
         <!-- Answer Sheet Header -->
         <div class="p-3.5 border-b border-slate-800 bg-slate-900/80 flex items-center justify-between">
@@ -289,9 +300,18 @@
             </h3>
             <p class="text-[10px] text-slate-400">Write answers below (numeric or text supported)</p>
           </div>
-          <span id="answer-sheet-total-qs" class="text-[10px] font-mono font-semibold px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
-            10 Questions
-          </span>
+          <div class="flex items-center space-x-2">
+            <span id="answer-sheet-total-qs" class="text-[10px] font-mono font-semibold px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
+              10 Questions
+            </span>
+            <button 
+              id="minimize-answers-btn" 
+              class="w-6 h-6 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white flex items-center justify-center text-xs transition-colors"
+              title="Minimize Answer Sheet"
+            >
+              <i class="fa-solid fa-chevron-right"></i>
+            </button>
+          </div>
         </div>
 
         <!-- Question Quick Jump Bar (Horizontal Scrollable Chips) -->
@@ -307,6 +327,16 @@
       </div>
 
     </div>
+
+    <!-- Floating Button to Reopen Answer Sheet when Minimized -->
+    <button 
+      id="floating-open-answers-btn" 
+      class="hidden fixed right-6 bottom-6 z-40 px-5 py-3 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-2xl shadow-indigo-600/50 flex items-center space-x-2.5 text-xs font-bold transition-all hover:scale-105 border border-indigo-400/40 cursor-pointer"
+      title="Click to reopen answer sheet"
+    >
+      <i class="fa-solid fa-pen-to-square text-sm"></i>
+      <span>Open Answer Sheet (<span id="floating-answered-count">0/10</span>)</span>
+    </button>
 
   </div>
 
