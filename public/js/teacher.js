@@ -433,7 +433,7 @@ function renderStudentsRoster() {
         </span>
       </td>
       <td class="py-3 px-3 text-right space-x-1.5">
-        <button onclick="viewStudentAnswers('${student.socketId}')" class="px-2 py-1 rounded bg-indigo-900/40 hover:bg-indigo-800 text-indigo-300 hover:text-white text-[11px] border border-indigo-800/50 transition-colors" title="Review answers submitted by student">
+        <button onclick="viewStudentAnswers('${student.socketId}', '${student.rollNo}')" class="px-2 py-1 rounded bg-indigo-900/40 hover:bg-indigo-800 text-indigo-300 hover:text-white text-[11px] border border-indigo-800/50 transition-colors cursor-pointer" title="Review answers submitted by student">
           <i class="fa-solid fa-file-pen mr-1"></i> Answers
         </button>
         <button onclick="inspectStudent('${student.socketId}')" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-[11px] border border-slate-700 transition-colors" title="Audit integrity logs">
@@ -554,42 +554,34 @@ function escapeHtml(text) {
     .replace(/'/g, '&#039;');
 }
 
-// Open Student Submitted Answers Review Modal
-window.viewStudentAnswers = async function(socketId) {
+// Open Student Submitted Answers Review Modal (Synchronous & Instantaneous)
+window.viewStudentAnswers = function(socketId, rollNo) {
   try {
-    // 1. First look up the student in the real-time student list in memory
-    let student = studentsList.find(s => s.socketId === socketId);
-
-    // 2. If not found in memory, fallback to API request
-    if (!student || !student.answers) {
-      try {
-        const res = await fetch(`/api/teacher/student-answers/${socketId}`);
-        const contentType = res.headers.get('content-type') || '';
-        if (contentType.includes('application/json')) {
-          const data = await res.json();
-          if (data && data.success && data.student) {
-            student = data.student;
-          }
-        }
-      } catch (fetchErr) {
-        console.warn('API fetch fallback error:', fetchErr);
-      }
+    // 1. Instant lookup in active student list (by socketId or rollNo)
+    let student = null;
+    if (socketId) {
+      student = studentsList.find(s => s.socketId === socketId);
+    }
+    if (!student && rollNo) {
+      student = studentsList.find(s => s.rollNo === rollNo);
     }
 
     if (!student) {
-      alert('Could not locate student submission data.');
+      alert('Student record not found in the active session roster.');
       return;
     }
 
     answersModalStudentName.textContent = `${student.name}'s Answer Sheet`;
-    answersModalStudentMeta.textContent = `Roll No: ${student.rollNo} • Status: ${student.status.toUpperCase()} ${student.submittedAt ? '• Submitted: ' + student.submittedAt : ''}`;
+    answersModalStudentMeta.textContent = `Roll No: ${student.rollNo} • Status: ${(student.status || 'in_test').toUpperCase()} ${student.submittedAt ? '• Submitted: ' + student.submittedAt : ''}`;
     
     const totalQ = currentExamState?.totalQuestions || student.totalQuestions || 10;
-    answersModalCount.textContent = `${student.answeredCount || 0} / ${totalQ} answered`;
+    const answersObj = student.answers || {};
+    const answeredCount = Object.values(answersObj).filter(a => a && a.trim().length > 0).length;
+
+    answersModalCount.textContent = `${answeredCount} / ${totalQ} answered`;
     answersModalAway.textContent = formatDuration(student.outDurationSeconds || 0);
     answersModalFlags.textContent = (student.violations || []).length;
 
-    const answersObj = student.answers || {};
     let html = '';
 
     for (let i = 1; i <= totalQ; i++) {
@@ -617,6 +609,7 @@ window.viewStudentAnswers = async function(socketId) {
     answersModalList.innerHTML = html;
     answersModal.classList.remove('hidden');
   } catch (err) {
+    console.error('Error rendering answers modal:', err);
     alert('Error loading answers: ' + err.message);
   }
 };
@@ -628,35 +621,59 @@ if (closeAnswersModalBtn) {
   });
 }
 
-// Refresh & Clear Inactive Students
+// Close Modal on Dark Backdrop Click
+if (answersModal) {
+  answersModal.addEventListener('click', (e) => {
+    if (e.target === answersModal) {
+      answersModal.classList.add('hidden');
+    }
+  });
+}
+
+// Close Modal on Esc Key
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    if (answersModal) answersModal.classList.add('hidden');
+    if (violationModal) violationModal.classList.add('hidden');
+  }
+});
+
+// Refresh & Clear All Sessions (Vanish All Student Records)
 const refreshClearInactiveBtn = document.getElementById('refresh-clear-inactive-btn');
 const refreshIcon = document.getElementById('refresh-icon');
 
 if (refreshClearInactiveBtn) {
   refreshClearInactiveBtn.addEventListener('click', async () => {
+    if (!confirm('Are you sure you want to clear all student sessions from the dashboard? All current sessions will vanish and only new candidate logins will be shown.')) {
+      return;
+    }
+
     if (refreshIcon) refreshIcon.classList.add('fa-spin');
 
+    // Immediately vanish local list for instant UI feedback!
+    studentsList = [];
+    renderStudentsRoster();
+
     try {
-      // 1. Emit via socket for instant zero-latency purge
+      // 1. Emit via socket for instant zero-latency purge across all teacher screens
       if (socket) {
         socket.emit('teacher:clear_inactive');
       }
 
-      // 2. Call backend API to purge inactive records
-      const res = await fetch('/api/teacher/students/clear-inactive', {
+      // 2. Call backend API to wipe all sessions
+      await fetch('/api/teacher/students/clear-inactive', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' }
       });
-      const data = await res.json();
 
-      // Refresh state
+      // Refresh exam state and KPI
       fetchExamState();
     } catch (err) {
-      console.error('Failed to clear inactive sessions:', err);
+      console.error('Failed to clear sessions:', err);
     } finally {
       setTimeout(() => {
         if (refreshIcon) refreshIcon.classList.remove('fa-spin');
-      }, 600);
+      }, 500);
     }
   });
 }

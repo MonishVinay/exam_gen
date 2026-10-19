@@ -252,35 +252,33 @@ app.post('/api/teacher/student/force-submit', requireTeacherAuth, (req, res) => 
   res.status(404).json({ success: false, error: 'Student not found' });
 });
 
-// Teacher: Clear Inactive / Offline Students and reset stale sessions
+// Teacher: Clear and wipe all student sessions from dashboard
 app.post('/api/teacher/students/clear-inactive', requireTeacherAuth, (req, res) => {
-  const activeSockets = io.sockets.sockets;
-  let removedCount = 0;
+  const previousCount = Object.keys(students).length;
 
-  for (const socketId in students) {
-    const student = students[socketId];
-    const isSocketConnected = activeSockets && activeSockets.has(socketId);
-
-    // If socket is disconnected, offline, or not actively attached, purge it!
-    if (!isSocketConnected || student.status === 'disconnected' || student.status === 'offline') {
-      delete students[socketId];
-      removedCount++;
-    }
+  // Disconnect any currently attached student sockets
+  if (io.sockets && io.in) {
+    try {
+      io.in('students_room').disconnectSockets(true);
+    } catch (e) {}
   }
 
-  // Notify teacher consoles of updated roster
-  io.to('teachers_room').emit('teacher:students_update', Object.values(students));
+  // WIPE ALL STUDENT SESSIONS COMPLETELY
+  students = {};
+
+  // Broadcast empty roster to teachers
+  io.to('teachers_room').emit('teacher:students_update', []);
   io.to('teachers_room').emit('teacher:new_notification', {
-    type: 'info',
-    title: 'Roster Refreshed',
-    message: `Cleared ${removedCount} inactive/offline student session(s). Only active candidate sessions are displayed.`,
+    type: 'warning',
+    title: 'Roster Reset',
+    message: `All ${previousCount} student session(s) have been vanished from the dashboard. Only fresh logins entering from now on will appear.`,
     timestamp: new Date().toLocaleTimeString()
   });
 
   res.json({
     success: true,
-    removedCount,
-    remainingCount: Object.keys(students).length
+    removedCount: previousCount,
+    remainingCount: 0
   });
 });
 
@@ -295,17 +293,15 @@ io.on('connection', (socket) => {
     socket.emit('teacher:students_update', Object.values(students));
   });
 
-  // Teacher manually clears inactive students via socket
+  // Teacher manually clears/resets all student sessions via socket
   socket.on('teacher:clear_inactive', () => {
-    const activeSockets = io.sockets.sockets;
-    for (const socketId in students) {
-      const student = students[socketId];
-      const isSocketConnected = activeSockets && activeSockets.has(socketId);
-      if (!isSocketConnected || student.status === 'disconnected' || student.status === 'offline') {
-        delete students[socketId];
-      }
+    if (io.sockets && io.in) {
+      try {
+        io.in('students_room').disconnectSockets(true);
+      } catch (e) {}
     }
-    io.to('teachers_room').emit('teacher:students_update', Object.values(students));
+    students = {};
+    io.to('teachers_room').emit('teacher:students_update', []);
   });
 
   // Student joining test room
