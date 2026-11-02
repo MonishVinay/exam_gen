@@ -25,6 +25,97 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
+// Ensure data folder and exam history file exist
+const dataDir = path.join(__dirname, 'data');
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir, { recursive: true });
+}
+const historyFilePath = path.join(dataDir, 'exam-history.json');
+if (!fs.existsSync(historyFilePath)) {
+  fs.writeFileSync(historyFilePath, JSON.stringify([], null, 2), 'utf-8');
+}
+
+function loadHistory() {
+  try {
+    if (fs.existsSync(historyFilePath)) {
+      const content = fs.readFileSync(historyFilePath, 'utf-8');
+      return JSON.parse(content || '[]');
+    }
+  } catch (err) {
+    console.error('Error reading history file:', err);
+  }
+  return [];
+}
+
+function saveHistory(historyList) {
+  try {
+    fs.writeFileSync(historyFilePath, JSON.stringify(historyList, null, 2), 'utf-8');
+    return true;
+  } catch (err) {
+    console.error('Error writing history file:', err);
+    return false;
+  }
+}
+
+// Helper: Archive Current Exam Session with all student responses
+function archiveCurrentExamSession(reason = 'Exam concluded') {
+  const studentList = Object.values(students);
+  if (studentList.length === 0 && !examState.pdfUrl) {
+    return null;
+  }
+
+  const history = loadHistory();
+  const sessionId = examState.sessionId || `exam-${examState.startTime || Date.now()}`;
+
+  const formattedStudents = studentList.map(s => ({
+    socketId: s.socketId,
+    name: s.name,
+    rollNo: s.rollNo,
+    status: s.status,
+    answers: s.answers || {},
+    answeredCount: Object.values(s.answers || {}).filter(a => a && a.trim().length > 0).length,
+    outDurationSeconds: (s.outDurationSeconds || 0) + (s.liveAwaySeconds || 0),
+    violations: s.violations || [],
+    submittedAt: s.submittedAt || (s.status === 'submitted' ? 'Submitted' : (examState.status === 'ended' ? 'Concluded' : 'In Progress')),
+    joinedAt: s.joinedAt
+  }));
+
+  const historyEntry = {
+    id: sessionId,
+    title: examState.title || 'General Assessment',
+    subject: examState.subject || '',
+    examCode: examState.examCode || 'EXAM101',
+    totalQuestions: examState.totalQuestions || 10,
+    durationMinutes: examState.durationMinutes || 60,
+    pdfFileName: examState.pdfFileName || '',
+    pdfUrl: examState.pdfUrl || '',
+    startTime: examState.startTime,
+    endTime: examState.endTime,
+    endedAt: new Date().toISOString(),
+    formattedDate: new Date().toLocaleString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    }),
+    reason: reason,
+    totalStudents: formattedStudents.length,
+    submittedCount: formattedStudents.filter(s => s.status === 'submitted' || s.submittedAt).length,
+    students: formattedStudents
+  };
+
+  const existingIdx = history.findIndex(h => h.id === sessionId);
+  if (existingIdx >= 0) {
+    history[existingIdx] = historyEntry;
+  } else {
+    history.unshift(historyEntry);
+  }
+
+  saveHistory(history);
+  return historyEntry;
+}
+
 // Multer Storage Configuration for PDF
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
@@ -161,6 +252,7 @@ app.post('/api/teacher/exam/start', requireTeacherAuth, (req, res) => {
   const now = Date.now();
   const durationMs = examState.durationMinutes * 60 * 1000;
 
+  examState.sessionId = `exam-${now}`;
   examState.status = 'active';
   examState.startTime = now;
   examState.endTime = now + durationMs;
@@ -173,19 +265,47 @@ app.post('/api/teacher/exam/start', requireTeacherAuth, (req, res) => {
   res.json({ success: true, examState });
 });
 
-// Teacher: End Exam
+// Teacher: End Exam (Conclude & Archive to History)
 app.post('/api/teacher/exam/end', requireTeacherAuth, (req, res) => {
   examState.status = 'ended';
+
+  // Save the complete session with all student responses to history
+  const archived = archiveCurrentExamSession('Concluded by examiner');
+
   io.emit('exam:ended', { message: 'The exam has been concluded by the examiner.' });
-  res.json({ success: true, examState });
+  if (archived) {
+    io.to('teachers_room').emit('teacher:history_updated', loadHistory());
+  }
+
+  res.json({ success: true, examState, archived });
 });
 
-// Teacher: Get Student Answers
+// Teacher: Get Student Answers (Current Live Exam or History Fallback)
 app.get('/api/teacher/student-answers/:socketId', requireTeacherAuth, (req, res) => {
-  const student = students[req.params.socketId];
+  const targetId = req.params.socketId;
+  let student = students[targetId];
+
+  // Fallback 1: lookup by rollNo in active session
   if (!student) {
-    return res.status(404).json({ success: false, error: 'Student not found' });
+    student = Object.values(students).find(s => s.rollNo === targetId);
   }
+
+  // Fallback 2: lookup across archived exam history
+  if (!student) {
+    const history = loadHistory();
+    for (const h of history) {
+      const found = (h.students || []).find(s => s.socketId === targetId || s.rollNo === targetId);
+      if (found) {
+        student = found;
+        break;
+      }
+    }
+  }
+
+  if (!student) {
+    return res.status(404).json({ success: false, error: 'Student submission not found' });
+  }
+
   res.json({
     success: true,
     student: {
@@ -195,21 +315,20 @@ app.get('/api/teacher/student-answers/:socketId', requireTeacherAuth, (req, res)
       status: student.status,
       answers: student.answers || {},
       answeredCount: student.answeredCount || 0,
-      totalQuestions: examState.totalQuestions,
-      outDurationSeconds: student.outDurationSeconds,
-      violations: student.violations,
+      totalQuestions: examState.totalQuestions || student.totalQuestions || 10,
+      outDurationSeconds: student.outDurationSeconds || 0,
+      violations: student.violations || [],
       submittedAt: student.submittedAt
     }
   });
 });
 
-// Teacher: Export All Submissions to CSV
+// Teacher: Export Current Live Exam Submissions to CSV
 app.get('/api/teacher/export-submissions', requireTeacherAuth, (req, res) => {
   const studentList = Object.values(students);
   const totalQ = examState.totalQuestions || 10;
 
-  // Build CSV Header
-  let header = ['Student Name', 'Roll Number', 'Status', 'Total Away (Seconds)', 'Total Flags', 'Questions Answered'];
+  let header = ['Student Name', 'Roll Number', 'Status', 'Submitted At', 'Total Away (Seconds)', 'Total Flags', 'Questions Answered'];
   for (let i = 1; i <= totalQ; i++) {
     header.push(`Q${i} Answer`);
   }
@@ -221,6 +340,7 @@ app.get('/api/teacher/export-submissions', requireTeacherAuth, (req, res) => {
       `"${(s.name || '').replace(/"/g, '""')}"`,
       `"${(s.rollNo || '').replace(/"/g, '""')}"`,
       `"${s.status || ''}"`,
+      `"${s.submittedAt || ''}"`,
       s.outDurationSeconds || 0,
       (s.violations || []).length,
       `${s.answeredCount || 0}/${totalQ}`
@@ -240,6 +360,91 @@ app.get('/api/teacher/export-submissions', requireTeacherAuth, (req, res) => {
   res.status(200).send(csvContent);
 });
 
+// ========================
+// EXAM HISTORY API ROUTES
+// ========================
+
+// Teacher: Get All Past Exam History
+app.get('/api/teacher/history', requireTeacherAuth, (req, res) => {
+  const history = loadHistory();
+  res.json({ success: true, history });
+});
+
+// Teacher: Get Details of a Past Exam
+app.get('/api/teacher/history/:id', requireTeacherAuth, (req, res) => {
+  const history = loadHistory();
+  const exam = history.find(h => h.id === req.params.id);
+  if (!exam) {
+    return res.status(404).json({ success: false, error: 'Exam history record not found' });
+  }
+  res.json({ success: true, exam });
+});
+
+// Teacher: Export Specific Past Exam from History to CSV
+app.get('/api/teacher/history/:id/export-csv', requireTeacherAuth, (req, res) => {
+  const history = loadHistory();
+  const exam = history.find(h => h.id === req.params.id);
+  if (!exam) {
+    return res.status(404).send('Exam record not found');
+  }
+
+  const studentList = exam.students || [];
+  const totalQ = exam.totalQuestions || 10;
+
+  let header = ['Student Name', 'Roll Number', 'Status', 'Submitted At', 'Total Away (Seconds)', 'Total Flags', 'Questions Answered'];
+  for (let i = 1; i <= totalQ; i++) {
+    header.push(`Q${i} Answer`);
+  }
+
+  const rows = [header.join(',')];
+
+  studentList.forEach(s => {
+    const row = [
+      `"${(s.name || '').replace(/"/g, '""')}"`,
+      `"${(s.rollNo || '').replace(/"/g, '""')}"`,
+      `"${s.status || ''}"`,
+      `"${s.submittedAt || ''}"`,
+      s.outDurationSeconds || 0,
+      (s.violations || []).length,
+      `${s.answeredCount || 0}/${totalQ}`
+    ];
+
+    for (let i = 1; i <= totalQ; i++) {
+      const ans = s.answers && s.answers[i] ? s.answers[i] : '';
+      row.push(`"${ans.replace(/"/g, '""')}"`);
+    }
+
+    rows.push(row.join(','));
+  });
+
+  const csvContent = rows.join('\r\n');
+  const safeTitle = (exam.title || 'exam').replace(/[^a-zA-Z0-9_-]/g, '_');
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}-history-${exam.id}.csv"`);
+  res.status(200).send(csvContent);
+});
+
+// Teacher: Delete Past Exam from History
+app.delete('/api/teacher/history/:id', requireTeacherAuth, (req, res) => {
+  let history = loadHistory();
+  const initialLen = history.length;
+  history = history.filter(h => h.id !== req.params.id);
+  saveHistory(history);
+
+  io.to('teachers_room').emit('teacher:history_updated', history);
+  res.json({ success: true, deleted: initialLen > history.length });
+});
+
+// Teacher: Manually Archive Current Session Now
+app.post('/api/teacher/history/archive-now', requireTeacherAuth, (req, res) => {
+  const archived = archiveCurrentExamSession('Manual archive by examiner');
+  if (archived) {
+    io.to('teachers_room').emit('teacher:history_updated', loadHistory());
+    return res.json({ success: true, archived });
+  }
+  res.status(400).json({ success: false, error: 'No active data to archive.' });
+});
+
 // Teacher: Force Submit Student
 app.post('/api/teacher/student/force-submit', requireTeacherAuth, (req, res) => {
   const { studentSocketId, reason } = req.body;
@@ -256,6 +461,11 @@ app.post('/api/teacher/student/force-submit', requireTeacherAuth, (req, res) => 
 app.post('/api/teacher/students/clear-inactive', requireTeacherAuth, (req, res) => {
   const previousCount = Object.keys(students).length;
 
+  // Auto-archive active session before wiping roster so student responses are permanently kept!
+  if (previousCount > 0) {
+    archiveCurrentExamSession('Archived on roster refresh');
+  }
+
   // Disconnect any currently attached student sockets
   if (io.sockets && io.in) {
     try {
@@ -266,12 +476,13 @@ app.post('/api/teacher/students/clear-inactive', requireTeacherAuth, (req, res) 
   // WIPE ALL STUDENT SESSIONS COMPLETELY
   students = {};
 
-  // Broadcast empty roster to teachers
+  // Broadcast empty roster to teachers and refresh history list
   io.to('teachers_room').emit('teacher:students_update', []);
+  io.to('teachers_room').emit('teacher:history_updated', loadHistory());
   io.to('teachers_room').emit('teacher:new_notification', {
     type: 'warning',
     title: 'Roster Reset',
-    message: `All ${previousCount} student session(s) have been vanished from the dashboard. Only fresh logins entering from now on will appear.`,
+    message: `All ${previousCount} student session(s) vanished from the live monitor. Responses are saved in Exam History. Only fresh logins entering from now on will appear.`,
     timestamp: new Date().toLocaleTimeString()
   });
 
@@ -280,6 +491,11 @@ app.post('/api/teacher/students/clear-inactive', requireTeacherAuth, (req, res) 
     removedCount: previousCount,
     remainingCount: 0
   });
+});
+
+// JSON 404 Fallback for all /api endpoints so clients never receive HTML error pages
+app.all('/api/*', (req, res) => {
+  res.status(404).json({ success: false, error: `Endpoint not found: ${req.method} ${req.originalUrl}` });
 });
 
 // ========================
@@ -291,6 +507,7 @@ io.on('connection', (socket) => {
     socket.join('teachers_room');
     socket.emit('exam:state_sync', examState);
     socket.emit('teacher:students_update', Object.values(students));
+    socket.emit('teacher:history_updated', loadHistory());
   });
 
   // Teacher manually clears/resets all student sessions via socket
@@ -461,6 +678,12 @@ io.on('connection', (socket) => {
       student.outOfFullscreenSince = null;
     }
 
+    // Auto-update history archive if exam is ended
+    if (examState.status === 'ended') {
+      archiveCurrentExamSession('Exam concluded');
+      io.to('teachers_room').emit('teacher:history_updated', loadHistory());
+    }
+
     io.to('teachers_room').emit('teacher:students_update', Object.values(students));
     io.to('teachers_room').emit('teacher:new_notification', {
       type: 'success',
@@ -492,10 +715,20 @@ io.on('connection', (socket) => {
   });
 });
 
-// Periodic ticker: Update outside fullscreen timer for students currently out of fullscreen
+// Periodic ticker: Update outside fullscreen timer and check exam duration
 setInterval(() => {
   let changed = false;
   const now = Date.now();
+
+  // Check if exam is active and timer has concluded
+  if (examState.status === 'active' && examState.endTime && now >= examState.endTime) {
+    examState.status = 'ended';
+    const archived = archiveCurrentExamSession('Exam duration completed');
+    io.emit('exam:ended', { message: 'The assessment time duration has concluded.' });
+    if (archived) {
+      io.to('teachers_room').emit('teacher:history_updated', loadHistory());
+    }
+  }
 
   for (const socketId in students) {
     const student = students[socketId];

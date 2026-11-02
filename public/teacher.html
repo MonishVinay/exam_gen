@@ -365,6 +365,57 @@
 
       </div>
 
+      <!-- Row 4: Exam History & Past Submissions -->
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
+        <div class="flex items-center justify-between pb-4 border-b border-slate-800">
+          <div>
+            <h3 class="text-base font-bold text-white flex items-center space-x-2">
+              <i class="fa-solid fa-clock-rotate-left text-amber-400"></i>
+              <span>Exam History & Past Submissions</span>
+            </h3>
+            <p class="text-xs text-slate-400">Archived assessment records, completed candidate answer sheets, and proctoring stats.</p>
+          </div>
+          <div class="flex items-center space-x-2.5">
+            <span id="history-count-badge" class="text-xs font-mono text-slate-400 bg-slate-800 px-2.5 py-1 rounded-md border border-slate-700">
+              0 Archived Exams
+            </span>
+            <button 
+              id="refresh-history-btn" 
+              class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-semibold flex items-center space-x-1.5 transition-all shadow-sm cursor-pointer"
+              title="Reload exam history from storage"
+            >
+              <i class="fa-solid fa-arrows-rotate text-xs" id="history-refresh-icon"></i>
+              <span>Refresh History</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- History Table -->
+        <div class="overflow-x-auto">
+          <table class="w-full text-left border-collapse text-xs">
+            <thead>
+              <tr class="border-b border-slate-800 text-slate-400 font-semibold uppercase tracking-wider">
+                <th class="py-3 px-3">Exam Session</th>
+                <th class="py-3 px-3">Date & Time Concluded</th>
+                <th class="py-3 px-3 text-center">Questions</th>
+                <th class="py-3 px-3 text-center">Candidates</th>
+                <th class="py-3 px-3 text-center">Submissions</th>
+                <th class="py-3 px-3 text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="exam-history-body" class="divide-y divide-slate-800/60">
+              <tr id="empty-history-row">
+                <td colspan="6" class="py-10 text-center text-slate-500 text-sm">
+                  <i class="fa-solid fa-box-archive text-3xl mb-3 block text-slate-600"></i>
+                  No past exam sessions archived yet.<br>
+                  <span class="text-xs text-slate-600">When an exam ends or is concluded, student answer sheets will automatically be saved here.</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
     </main>
 
     <!-- Footer -->
@@ -404,6 +455,72 @@
           <!-- Populated dynamically -->
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- Modal: Past Exam Candidate Submissions Review -->
+  <div id="past-exam-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+    <div class="w-full max-w-4xl bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-2xl flex flex-col max-h-[90vh]">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-4 mb-4">
+        <div>
+          <h3 class="text-base font-bold text-white flex items-center space-x-2">
+            <i class="fa-solid fa-clock-rotate-left text-amber-400"></i>
+            <span id="past-exam-title">Past Exam Details</span>
+          </h3>
+          <p class="text-xs text-slate-400" id="past-exam-meta">Concluded at: --</p>
+        </div>
+        <div class="flex items-center space-x-3">
+          <a id="past-exam-export-btn" href="#" target="_blank" class="px-3 py-1.5 rounded-lg bg-emerald-600/90 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center space-x-1.5 shadow-md shadow-emerald-500/20 transition-all">
+            <i class="fa-solid fa-file-csv text-sm"></i>
+            <span>Export CSV</span>
+          </a>
+          <button id="close-past-exam-modal-btn" class="text-slate-400 hover:text-white text-lg">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+      </div>
+
+      <!-- Past Exam Summary Cards -->
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs mb-4">
+        <div class="p-3 rounded-xl bg-slate-800/80 border border-slate-700/80">
+          <span class="text-slate-400 block text-[11px]">Total Candidates</span>
+          <span class="font-bold text-lg text-white" id="past-exam-students-count">0</span>
+        </div>
+        <div class="p-3 rounded-xl bg-slate-800/80 border border-slate-700/80">
+          <span class="text-slate-400 block text-[11px]">Submissions</span>
+          <span class="font-bold text-lg text-emerald-400" id="past-exam-submitted-count">0</span>
+        </div>
+        <div class="p-3 rounded-xl bg-slate-800/80 border border-slate-700/80">
+          <span class="text-slate-400 block text-[11px]">Questions</span>
+          <span class="font-bold text-lg text-indigo-400" id="past-exam-total-questions">0</span>
+        </div>
+        <div class="p-3 rounded-xl bg-slate-800/80 border border-slate-700/80">
+          <span class="text-slate-400 block text-[11px]">Exam Code</span>
+          <span class="font-bold text-lg text-amber-400 font-mono" id="past-exam-code">--</span>
+        </div>
+      </div>
+
+      <!-- Student Candidate Submissions Table -->
+      <div class="flex-1 overflow-y-auto">
+        <table class="w-full text-left border-collapse text-xs">
+          <thead>
+            <tr class="border-b border-slate-800 text-slate-400 font-semibold uppercase tracking-wider">
+              <th class="py-2.5 px-3">Student Name</th>
+              <th class="py-2.5 px-3">Roll No</th>
+              <th class="py-2.5 px-3">Status</th>
+              <th class="py-2.5 px-3 text-center">Answered</th>
+              <th class="py-2.5 px-3 text-center">Time Away</th>
+              <th class="py-2.5 px-3 text-center">Flags</th>
+              <th class="py-2.5 px-3 text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="past-exam-students-body" class="divide-y divide-slate-800/60">
+            <!-- Dynamically populated -->
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
   <!-- Modal: Student Submitted Answers Review -->
   <div id="answers-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
     <div class="w-full max-w-2xl bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-2xl flex flex-col max-h-[85vh]">

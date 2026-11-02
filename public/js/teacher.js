@@ -61,6 +61,27 @@ const answersModalFlags = document.getElementById('answers-modal-flags');
 const answersModalList = document.getElementById('answers-modal-list');
 const closeAnswersModalBtn = document.getElementById('close-answers-modal-btn');
 
+// Exam History Elements & State
+let examHistoryList = [];
+let currentPastExam = null;
+
+const examHistoryBody = document.getElementById('exam-history-body');
+const historyCountBadge = document.getElementById('history-count-badge');
+const refreshHistoryBtn = document.getElementById('refresh-history-btn');
+const historyRefreshIcon = document.getElementById('history-refresh-icon');
+
+// Past Exam Submissions Modal Elements
+const pastExamModal = document.getElementById('past-exam-modal');
+const pastExamTitle = document.getElementById('past-exam-title');
+const pastExamMeta = document.getElementById('past-exam-meta');
+const pastExamExportBtn = document.getElementById('past-exam-export-btn');
+const closePastExamModalBtn = document.getElementById('close-past-exam-modal-btn');
+const pastExamStudentsCount = document.getElementById('past-exam-students-count');
+const pastExamSubmittedCount = document.getElementById('past-exam-submitted-count');
+const pastExamTotalQuestions = document.getElementById('past-exam-total-questions');
+const pastExamCode = document.getElementById('past-exam-code');
+const pastExamStudentsBody = document.getElementById('past-exam-students-body');
+
 // Initialize Check
 document.addEventListener('DOMContentLoaded', async () => {
   try {
@@ -95,6 +116,7 @@ function showDashboard() {
   dashboardContainer.classList.remove('hidden');
   initSocket();
   fetchExamState();
+  fetchExamHistory();
 }
 
 // Teacher Login
@@ -179,6 +201,11 @@ function initSocket() {
   socket.on('teacher:students_update', (updatedStudents) => {
     studentsList = updatedStudents;
     renderStudentsRoster();
+  });
+
+  socket.on('teacher:history_updated', (historyData) => {
+    const list = Array.isArray(historyData) ? historyData : (historyData?.history || []);
+    renderExamHistory(list);
   });
 
   socket.on('teacher:new_notification', (notif) => {
@@ -554,8 +581,51 @@ function escapeHtml(text) {
     .replace(/'/g, '&#039;');
 }
 
-// Open Student Submitted Answers Review Modal (Synchronous & Instantaneous)
-window.viewStudentAnswers = function(socketId, rollNo) {
+// Render Student Answers Modal
+function displayStudentAnswersModal(student, totalQuestions, examTitle) {
+  if (!student) return;
+
+  answersModalStudentName.textContent = `${escapeHtml(student.name || 'Candidate')}'s Answer Sheet`;
+  answersModalStudentMeta.textContent = `Roll No: ${escapeHtml(student.rollNo || '--')} • Status: ${(student.status || 'submitted').toUpperCase()}${student.submittedAt ? ' • Submitted: ' + student.submittedAt : ''}${examTitle ? ' • (' + escapeHtml(examTitle) + ')' : ''}`;
+
+  const totalQ = totalQuestions || currentExamState?.totalQuestions || student.totalQuestions || 10;
+  const answersObj = student.answers || {};
+  const answeredCount = Object.values(answersObj).filter(a => a && a.trim().length > 0).length;
+
+  answersModalCount.textContent = `${answeredCount} / ${totalQ} answered`;
+  answersModalAway.textContent = formatDuration(student.outDurationSeconds || 0);
+  answersModalFlags.textContent = (student.violations || []).length;
+
+  let html = '';
+
+  for (let i = 1; i <= totalQ; i++) {
+    const ans = answersObj[i];
+    const isAnswered = ans && ans.trim().length > 0;
+
+    html += `
+      <div class="p-3.5 rounded-xl border ${isAnswered ? 'border-slate-700 bg-slate-800/70' : 'border-slate-800 bg-slate-900/60'}">
+        <div class="flex items-center justify-between mb-2">
+          <span class="font-bold text-white flex items-center space-x-2">
+            <span class="w-6 h-6 rounded-md bg-indigo-600/30 text-indigo-400 flex items-center justify-center text-xs font-mono font-bold">Q${i}</span>
+            <span class="text-xs">Question ${i}</span>
+          </span>
+          <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full ${isAnswered ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-slate-800 text-slate-500 border border-slate-700'}">
+            ${isAnswered ? 'Answered ✓' : 'Not Answered'}
+          </span>
+        </div>
+        <div class="p-3 rounded-lg bg-slate-950 border border-slate-800/80 font-mono text-xs text-slate-200 whitespace-pre-wrap leading-relaxed select-text min-h-[44px]">
+          ${isAnswered ? escapeHtml(ans) : '<span class="text-slate-600 italic">No answer provided by candidate.</span>'}
+        </div>
+      </div>
+    `;
+  }
+
+  answersModalList.innerHTML = html;
+  answersModal.classList.remove('hidden');
+}
+
+// Open Student Submitted Answers Review Modal (Synchronous, Zero-Latency & Fail-Safe)
+window.viewStudentAnswers = async function(socketId, rollNo) {
   try {
     // 1. Instant lookup in active student list (by socketId or rollNo)
     let student = null;
@@ -566,58 +636,266 @@ window.viewStudentAnswers = function(socketId, rollNo) {
       student = studentsList.find(s => s.rollNo === rollNo);
     }
 
+    // 2. If not found in active roster, look inside archived exam history
+    if (!student && examHistoryList.length > 0) {
+      for (const pastExam of examHistoryList) {
+        const found = (pastExam.students || []).find(s => (rollNo && s.rollNo === rollNo) || (socketId && s.socketId === socketId));
+        if (found) {
+          student = found;
+          displayStudentAnswersModal(student, pastExam.totalQuestions || 10, pastExam.title);
+          return;
+        }
+      }
+    }
+
+    // 3. Fallback: API request if not cached in memory
+    if (!student && socketId) {
+      try {
+        const res = await fetch(`/api/teacher/student-answers/${encodeURIComponent(socketId)}`);
+        const contentType = res.headers.get('content-type') || '';
+        if (res.ok && contentType.includes('application/json')) {
+          const data = await res.json();
+          if (data && data.success && data.student) {
+            student = data.student;
+          }
+        }
+      } catch (fetchErr) {
+        console.warn('API fetch fallback note:', fetchErr);
+      }
+    }
+
     if (!student) {
-      alert('Student record not found in the active session roster.');
+      alert('Student record not found in active session roster or archives.');
       return;
     }
 
-    answersModalStudentName.textContent = `${student.name}'s Answer Sheet`;
-    answersModalStudentMeta.textContent = `Roll No: ${student.rollNo} • Status: ${(student.status || 'in_test').toUpperCase()} ${student.submittedAt ? '• Submitted: ' + student.submittedAt : ''}`;
-    
-    const totalQ = currentExamState?.totalQuestions || student.totalQuestions || 10;
-    const answersObj = student.answers || {};
-    const answeredCount = Object.values(answersObj).filter(a => a && a.trim().length > 0).length;
-
-    answersModalCount.textContent = `${answeredCount} / ${totalQ} answered`;
-    answersModalAway.textContent = formatDuration(student.outDurationSeconds || 0);
-    answersModalFlags.textContent = (student.violations || []).length;
-
-    let html = '';
-
-    for (let i = 1; i <= totalQ; i++) {
-      const ans = answersObj[i];
-      const isAnswered = ans && ans.trim().length > 0;
-
-      html += `
-        <div class="p-3.5 rounded-xl border ${isAnswered ? 'border-slate-700 bg-slate-800/70' : 'border-slate-800 bg-slate-900/60'}">
-          <div class="flex items-center justify-between mb-2">
-            <span class="font-bold text-white flex items-center space-x-2">
-              <span class="w-6 h-6 rounded-md bg-indigo-600/30 text-indigo-400 flex items-center justify-center text-xs font-mono font-bold">Q${i}</span>
-              <span class="text-xs">Question ${i}</span>
-            </span>
-            <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full ${isAnswered ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-slate-800 text-slate-500 border border-slate-700'}">
-              ${isAnswered ? 'Answered ✓' : 'Not Answered'}
-            </span>
-          </div>
-          <div class="p-3 rounded-lg bg-slate-950 border border-slate-800/80 font-mono text-xs text-slate-200 whitespace-pre-wrap leading-relaxed select-text min-h-[44px]">
-            ${isAnswered ? escapeHtml(ans) : '<span class="text-slate-600 italic">No answer provided by candidate.</span>'}
-          </div>
-        </div>
-      `;
-    }
-
-    answersModalList.innerHTML = html;
-    answersModal.classList.remove('hidden');
+    displayStudentAnswersModal(student, currentExamState?.totalQuestions || student.totalQuestions || 10);
   } catch (err) {
     console.error('Error rendering answers modal:', err);
     alert('Error loading answers: ' + err.message);
   }
 };
 
+// View Past Student Answers from Archived Exam
+window.viewPastStudentAnswers = function(examId, rollNo) {
+  try {
+    const exam = examHistoryList.find(e => e.id === examId) || currentPastExam;
+    if (!exam) {
+      alert('Archived exam record not found.');
+      return;
+    }
+    const student = (exam.students || []).find(s => s.rollNo === rollNo);
+    if (!student) {
+      alert('Candidate submission record not found in this archive.');
+      return;
+    }
+    displayStudentAnswersModal(student, exam.totalQuestions || 10, exam.title);
+  } catch (err) {
+    console.error('Error loading past answers:', err);
+    alert('Error loading answers: ' + err.message);
+  }
+};
+
+// Open Past Exam Detail Modal
+window.openPastExamModal = function(examId) {
+  const exam = examHistoryList.find(e => e.id === examId);
+  if (!exam) {
+    alert('Exam history record not found.');
+    return;
+  }
+
+  currentPastExam = exam;
+  if (pastExamTitle) pastExamTitle.textContent = exam.title || 'Past Exam Details';
+  if (pastExamMeta) {
+    const dateStr = exam.formattedDate || (exam.endedAt ? new Date(exam.endedAt).toLocaleString() : '--');
+    pastExamMeta.textContent = `Subject: ${exam.subject || 'General Assessment'} • Concluded: ${dateStr} • Reason: ${exam.reason || 'Concluded'}`;
+  }
+  if (pastExamStudentsCount) pastExamStudentsCount.textContent = (exam.students || []).length;
+  if (pastExamSubmittedCount) pastExamSubmittedCount.textContent = (exam.students || []).filter(s => s.status === 'submitted' || s.submittedAt).length;
+  if (pastExamTotalQuestions) pastExamTotalQuestions.textContent = exam.totalQuestions || 10;
+  if (pastExamCode) pastExamCode.textContent = exam.examCode || 'EXAM';
+  if (pastExamExportBtn) pastExamExportBtn.href = `/api/teacher/history/${exam.id}/export-csv`;
+
+  const students = exam.students || [];
+  if (pastExamStudentsBody) {
+    if (students.length === 0) {
+      pastExamStudentsBody.innerHTML = `
+        <tr>
+          <td colspan="7" class="py-8 text-center text-slate-500 text-xs">
+            No candidates participated in this assessment session.
+          </td>
+        </tr>
+      `;
+    } else {
+      let sHtml = '';
+      students.forEach((s) => {
+        const answeredCount = s.answeredCount !== undefined ? s.answeredCount : (Object.values(s.answers || {}).filter(a => a && a.trim().length > 0).length);
+        const isSub = s.status === 'submitted' || s.submittedAt;
+        sHtml += `
+          <tr class="hover:bg-slate-800/30 transition-colors">
+            <td class="py-2.5 px-3 font-semibold text-white">${escapeHtml(s.name || 'Candidate')}</td>
+            <td class="py-2.5 px-3 font-mono text-slate-400">${escapeHtml(s.rollNo || '--')}</td>
+            <td class="py-2.5 px-3">
+              <span class="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${isSub ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-slate-800 text-slate-400 border border-slate-700'}">
+                ${escapeHtml(s.status || 'ended')}
+              </span>
+            </td>
+            <td class="py-2.5 px-3 text-center font-mono font-bold text-indigo-400">
+              ${answeredCount} / ${exam.totalQuestions || 10}
+            </td>
+            <td class="py-2.5 px-3 text-center font-mono ${s.outDurationSeconds > 0 ? 'text-rose-400' : 'text-slate-400'}">
+              ${formatDuration(s.outDurationSeconds || 0)}
+            </td>
+            <td class="py-2.5 px-3 text-center">
+              <span class="px-2 py-0.5 rounded-full text-[10px] font-bold ${(s.violations || []).length > 0 ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30' : 'bg-slate-800 text-slate-500'}">
+                ${(s.violations || []).length}
+              </span>
+            </td>
+            <td class="py-2.5 px-3 text-right">
+              <button onclick="viewPastStudentAnswers('${exam.id}', '${s.rollNo}')" class="px-2 py-1 rounded bg-indigo-900/40 hover:bg-indigo-800 text-indigo-300 hover:text-white text-[11px] border border-indigo-800/50 transition-colors cursor-pointer" title="View submitted answers">
+                <i class="fa-solid fa-file-pen mr-1"></i> Answers
+              </button>
+            </td>
+          </tr>
+        `;
+      });
+      pastExamStudentsBody.innerHTML = sHtml;
+    }
+  }
+
+  if (pastExamModal) pastExamModal.classList.remove('hidden');
+};
+
+// Delete Past Exam from History
+window.deletePastExam = async function(examId) {
+  if (!confirm('Are you sure you want to permanently delete this exam history record? This action cannot be undone.')) {
+    return;
+  }
+
+  try {
+    const res = await fetch(`/api/teacher/history/${encodeURIComponent(examId)}`, {
+      method: 'DELETE'
+    });
+    const data = await res.json();
+    if (data.success) {
+      examHistoryList = examHistoryList.filter(e => e.id !== examId);
+      renderExamHistory(examHistoryList);
+    } else {
+      alert(data.error || 'Failed to delete record.');
+    }
+  } catch (err) {
+    console.error('Failed to delete past exam record:', err);
+    alert('Failed to delete past exam record: ' + err.message);
+  }
+};
+
+// Fetch Exam History from Server
+async function fetchExamHistory() {
+  try {
+    const res = await fetch('/api/teacher/history');
+    if (!res.ok) return;
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) return;
+
+    const data = await res.json();
+    const list = Array.isArray(data) ? data : (data.history || []);
+    renderExamHistory(list);
+  } catch (err) {
+    console.error('Failed to fetch exam history:', err);
+  }
+}
+
+// Render Past Exam History in Table
+function renderExamHistory(historyList) {
+  examHistoryList = historyList || [];
+
+  if (historyCountBadge) {
+    historyCountBadge.textContent = `${examHistoryList.length} Archived Exam${examHistoryList.length === 1 ? '' : 's'}`;
+  }
+
+  if (!examHistoryBody) return;
+
+  if (examHistoryList.length === 0) {
+    examHistoryBody.innerHTML = `
+      <tr id="empty-history-row">
+        <td colspan="6" class="py-10 text-center text-slate-500 text-sm">
+          <i class="fa-solid fa-box-archive text-3xl mb-3 block text-slate-600"></i>
+          No past exam sessions archived yet.<br>
+          <span class="text-xs text-slate-600">When an exam ends or is concluded, student answer sheets will automatically be saved here.</span>
+        </td>
+      </tr>
+    `;
+    return;
+  }
+
+  let html = '';
+  examHistoryList.forEach((exam) => {
+    const candidateCount = (exam.students || []).length;
+    const submittedCount = (exam.students || []).filter(s => s.status === 'submitted' || s.submittedAt).length;
+    const concludedDate = exam.formattedDate || (exam.endedAt ? new Date(exam.endedAt).toLocaleString() : '--');
+
+    html += `
+      <tr class="hover:bg-slate-800/40 transition-colors">
+        <td class="py-3 px-3">
+          <div class="font-bold text-white">${escapeHtml(exam.title || 'Untitled Assessment')}</div>
+          <div class="text-[11px] font-mono text-slate-400">${escapeHtml(exam.subject || 'General Assessment')} • <span class="text-amber-400 font-semibold">${escapeHtml(exam.examCode || 'EXAM')}</span></div>
+        </td>
+        <td class="py-3 px-3 text-slate-300 font-mono text-[11px]">
+          ${concludedDate}
+        </td>
+        <td class="py-3 px-3 text-center">
+          <span class="px-2 py-0.5 rounded-full font-mono text-[11px] font-bold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
+            ${exam.totalQuestions || 10} Qs
+          </span>
+        </td>
+        <td class="py-3 px-3 text-center font-mono font-bold text-slate-300">
+          ${candidateCount}
+        </td>
+        <td class="py-3 px-3 text-center">
+          <span class="px-2 py-0.5 rounded-full font-mono text-[11px] font-bold ${submittedCount > 0 ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-slate-800 text-slate-500'}">
+            ${submittedCount} / ${candidateCount}
+          </span>
+        </td>
+        <td class="py-3 px-3 text-right space-x-1.5">
+          <button onclick="openPastExamModal('${exam.id}')" class="px-2.5 py-1 rounded bg-indigo-900/40 hover:bg-indigo-800 text-indigo-300 hover:text-white text-[11px] border border-indigo-800/50 transition-colors cursor-pointer" title="View candidates and their submitted answers">
+            <i class="fa-solid fa-list-check mr-1"></i> View Submissions
+          </button>
+          <a href="/api/teacher/history/${exam.id}/export-csv" target="_blank" class="inline-block px-2.5 py-1 rounded bg-emerald-900/40 hover:bg-emerald-800 text-emerald-300 hover:text-white text-[11px] border border-emerald-800/50 transition-colors" title="Download CSV answer sheet">
+            <i class="fa-solid fa-file-csv mr-1"></i> CSV
+          </a>
+          <button onclick="deletePastExam('${exam.id}')" class="px-2 py-1 rounded bg-rose-900/30 hover:bg-rose-800 text-rose-300 hover:text-white text-[11px] border border-rose-800/40 transition-colors cursor-pointer" title="Delete record from history">
+            <i class="fa-solid fa-trash-can"></i>
+          </button>
+        </td>
+      </tr>
+    `;
+  });
+
+  examHistoryBody.innerHTML = html;
+}
+
 // Close Answers Modal
 if (closeAnswersModalBtn) {
   closeAnswersModalBtn.addEventListener('click', () => {
     answersModal.classList.add('hidden');
+  });
+}
+
+// Close Past Exam Modal
+if (closePastExamModalBtn) {
+  closePastExamModalBtn.addEventListener('click', () => {
+    if (pastExamModal) pastExamModal.classList.add('hidden');
+  });
+}
+
+// Refresh Exam History Button
+if (refreshHistoryBtn) {
+  refreshHistoryBtn.addEventListener('click', async () => {
+    if (historyRefreshIcon) historyRefreshIcon.classList.add('fa-spin');
+    await fetchExamHistory();
+    setTimeout(() => {
+      if (historyRefreshIcon) historyRefreshIcon.classList.remove('fa-spin');
+    }, 400);
   });
 }
 
@@ -630,11 +908,20 @@ if (answersModal) {
   });
 }
 
+if (pastExamModal) {
+  pastExamModal.addEventListener('click', (e) => {
+    if (e.target === pastExamModal) {
+      pastExamModal.classList.add('hidden');
+    }
+  });
+}
+
 // Close Modal on Esc Key
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     if (answersModal) answersModal.classList.add('hidden');
     if (violationModal) violationModal.classList.add('hidden');
+    if (pastExamModal) pastExamModal.classList.add('hidden');
   }
 });
 
