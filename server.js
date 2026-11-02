@@ -494,7 +494,7 @@ app.post('/api/teacher/students/clear-inactive', requireTeacherAuth, (req, res) 
 });
 
 // JSON 404 Fallback for all /api endpoints so clients never receive HTML error pages
-app.all('/api/*', (req, res) => {
+app.use('/api', (req, res) => {
   res.status(404).json({ success: false, error: `Endpoint not found: ${req.method} ${req.originalUrl}` });
 });
 
