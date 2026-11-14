@@ -226,7 +226,8 @@ app.post('/api/teacher/exam', requireTeacherAuth, upload.single('examPdf'), (req
 
     examState.title = title || examState.title;
     examState.subject = subject || examState.subject;
-    examState.durationMinutes = parseInt(durationMinutes, 10) || 60;
+    const parsedDuration = parseInt(durationMinutes, 10) || 60;
+    examState.durationMinutes = Math.min(3000, Math.max(1, parsedDuration));
     examState.totalQuestions = Math.max(1, parseInt(totalQuestions, 10) || 10);
     examState.examCode = (examCode || 'EXAM101').toUpperCase().trim();
     examState.status = 'created';
