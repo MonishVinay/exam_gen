@@ -69,6 +69,8 @@ const examHistoryBody = document.getElementById('exam-history-body');
 const historyCountBadge = document.getElementById('history-count-badge');
 const refreshHistoryBtn = document.getElementById('refresh-history-btn');
 const historyRefreshIcon = document.getElementById('history-refresh-icon');
+const restoreHistoryBtn = document.getElementById('restore-history-btn');
+const importBackupFileInput = document.getElementById('import-backup-file-input');
 
 // Past Exam Submissions Modal Elements
 const pastExamModal = document.getElementById('past-exam-modal');
@@ -789,25 +791,81 @@ window.deletePastExam = async function(examId) {
   }
 };
 
-// Fetch Exam History from Server
+// Fetch Exam History from Server with Dual-Sync (Server Disk + Browser LocalStorage)
 async function fetchExamHistory() {
   try {
     const res = await fetch('/api/teacher/history');
-    if (!res.ok) return;
-    const contentType = res.headers.get('content-type') || '';
-    if (!contentType.includes('application/json')) return;
+    let serverList = [];
+    if (res.ok) {
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        const data = await res.json();
+        serverList = Array.isArray(data) ? data : (data.history || []);
+      }
+    }
 
-    const data = await res.json();
-    const list = Array.isArray(data) ? data : (data.history || []);
-    renderExamHistory(list);
+    // 1. Read persistent local storage backup from browser
+    const localRaw = localStorage.getItem('PROCTOR_PERMANENT_EXAM_HISTORY');
+    let localList = [];
+    try {
+      if (localRaw) localList = JSON.parse(localRaw);
+    } catch (e) {}
+
+    // 2. Disaster Recovery: If server was restarted/redeployed (empty on Render) but browser has past exams
+    if (serverList.length === 0 && localList.length > 0) {
+      console.log(`[STORAGE] Auto-restoring ${localList.length} past exam(s) from browser cache to server...`);
+      try {
+        const restoreRes = await fetch('/api/teacher/history/restore-backup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ history: localList })
+        });
+        if (restoreRes.ok) {
+          const restoreData = await restoreRes.json();
+          serverList = restoreData.history || localList;
+        }
+      } catch (rErr) {
+        console.error('[STORAGE] Auto-restore sync error:', rErr);
+      }
+    }
+
+    // 3. Merge server and local lists so no record is ever dropped
+    const mergedMap = {};
+    for (const h of localList) {
+      if (h && h.id) mergedMap[h.id] = h;
+    }
+    for (const h of serverList) {
+      if (h && h.id) mergedMap[h.id] = h;
+    }
+    const finalHistory = Object.values(mergedMap);
+    finalHistory.sort((a, b) => (new Date(b.concludedAt || b.endedAt || 0)) - (new Date(a.concludedAt || a.endedAt || 0)));
+
+    // Save updated permanent replica in browser storage
+    try {
+      localStorage.setItem('PROCTOR_PERMANENT_EXAM_HISTORY', JSON.stringify(finalHistory));
+    } catch (e) {}
+
+    renderExamHistory(finalHistory);
   } catch (err) {
-    console.error('Failed to fetch exam history:', err);
+    console.error('Failed to fetch exam history from server:', err);
+    // Offline fallback: load from browser storage
+    try {
+      const localRaw = localStorage.getItem('PROCTOR_PERMANENT_EXAM_HISTORY');
+      if (localRaw) {
+        renderExamHistory(JSON.parse(localRaw));
+      }
+    } catch (e) {}
   }
 }
 
 // Render Past Exam History in Table
 function renderExamHistory(historyList) {
   examHistoryList = historyList || [];
+
+  // Update browser persistent storage
+  try {
+    localStorage.setItem('PROCTOR_PERMANENT_EXAM_HISTORY', JSON.stringify(examHistoryList));
+  } catch (e) {}
 
   if (historyCountBadge) {
     historyCountBadge.textContent = `${examHistoryList.length} Archived Exam${examHistoryList.length === 1 ? '' : 's'}`;
@@ -821,7 +879,7 @@ function renderExamHistory(historyList) {
         <td colspan="6" class="py-10 text-center text-slate-500 text-sm">
           <i class="fa-solid fa-box-archive text-3xl mb-3 block text-slate-600"></i>
           No past exam sessions archived yet.<br>
-          <span class="text-xs text-slate-600">When an exam ends or is concluded, student answer sheets will automatically be saved here.</span>
+          <span class="text-xs text-slate-600">When an exam ends or candidates submit, student answer sheets are automatically and permanently saved here.</span>
         </td>
       </tr>
     `;
@@ -896,6 +954,46 @@ if (refreshHistoryBtn) {
     setTimeout(() => {
       if (historyRefreshIcon) historyRefreshIcon.classList.remove('fa-spin');
     }, 400);
+  });
+}
+
+// Restore / Import Backup Button
+if (restoreHistoryBtn && importBackupFileInput) {
+  restoreHistoryBtn.addEventListener('click', () => {
+    importBackupFileInput.value = '';
+    importBackupFileInput.click();
+  });
+
+  importBackupFileInput.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const historyArray = Array.isArray(parsed) ? parsed : (parsed.history || []);
+
+      if (!Array.isArray(historyArray) || historyArray.length === 0) {
+        alert('Invalid or empty backup file. Expected a JSON file with an array of exam records.');
+        return;
+      }
+
+      const res = await fetch('/api/teacher/history/restore-backup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ history: historyArray })
+      });
+
+      const data = await res.json();
+      if (data.success) {
+        alert(`Successfully restored ${data.count} exam session(s) into history!`);
+        renderExamHistory(data.history || historyArray);
+      } else {
+        alert(data.error || 'Failed to restore backup.');
+      }
+    } catch (parseErr) {
+      alert('Error reading backup file: ' + parseErr.message);
+    }
   });
 }
 

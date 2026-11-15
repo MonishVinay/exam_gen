@@ -375,17 +375,39 @@
             </h3>
             <p class="text-xs text-slate-400">Archived assessment records, completed candidate answer sheets, and proctoring stats.</p>
           </div>
-          <div class="flex items-center space-x-2.5">
+          <div class="flex items-center flex-wrap gap-2">
+            <span class="text-[11px] font-mono text-emerald-400 bg-emerald-500/10 px-2.5 py-1 rounded-md border border-emerald-500/20 flex items-center space-x-1.5" title="Redundant multi-layer persistence active: Server Disk + Browser Local Storage">
+              <i class="fa-solid fa-shield-halved text-[10px]"></i>
+              <span>Permanent Storage</span>
+            </span>
             <span id="history-count-badge" class="text-xs font-mono text-slate-400 bg-slate-800 px-2.5 py-1 rounded-md border border-slate-700">
               0 Archived Exams
             </span>
+            <a 
+              href="/api/teacher/history/backup-json" 
+              id="download-history-backup-btn" 
+              class="px-2.5 py-1 rounded-lg bg-indigo-900/40 hover:bg-indigo-800 text-indigo-300 hover:text-white border border-indigo-700/50 text-xs font-semibold flex items-center space-x-1.5 transition-all shadow-sm cursor-pointer"
+              title="Download full history database as JSON to your computer"
+            >
+              <i class="fa-solid fa-cloud-arrow-down text-xs"></i>
+              <span>Download Backup</span>
+            </a>
+            <button 
+              id="restore-history-btn" 
+              class="px-2.5 py-1 rounded-lg bg-emerald-900/40 hover:bg-emerald-800 text-emerald-300 hover:text-white border border-emerald-700/50 text-xs font-semibold flex items-center space-x-1.5 transition-all shadow-sm cursor-pointer"
+              title="Restore / Import history from a JSON backup file"
+            >
+              <i class="fa-solid fa-cloud-arrow-up text-xs"></i>
+              <span>Restore Backup</span>
+            </button>
+            <input type="file" id="import-backup-file-input" accept=".json" class="hidden">
             <button 
               id="refresh-history-btn" 
-              class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-semibold flex items-center space-x-1.5 transition-all shadow-sm cursor-pointer"
+              class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-semibold flex items-center space-x-1.5 transition-all shadow-sm cursor-pointer"
               title="Reload exam history from storage"
             >
               <i class="fa-solid fa-arrows-rotate text-xs" id="history-refresh-icon"></i>
-              <span>Refresh History</span>
+              <span>Refresh</span>
             </button>
           </div>
         </div>

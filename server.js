@@ -25,74 +25,244 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Ensure data folder and exam history file exist
+// Ensure data directories exist (multi-tier persistence)
 const dataDir = path.join(__dirname, 'data');
 if (!fs.existsSync(dataDir)) {
   fs.mkdirSync(dataDir, { recursive: true });
 }
+const sessionsDir = path.join(dataDir, 'sessions');
+if (!fs.existsSync(sessionsDir)) {
+  fs.mkdirSync(sessionsDir, { recursive: true });
+}
+
 const historyFilePath = path.join(dataDir, 'exam-history.json');
+const backupFilePath = path.join(dataDir, 'exam-history-backup.json');
+const activeSessionFilePath = path.join(sessionsDir, 'active-session.json');
+
 if (!fs.existsSync(historyFilePath)) {
   fs.writeFileSync(historyFilePath, JSON.stringify([], null, 2), 'utf-8');
 }
 
+// 1. Rock-Solid History Loading with Triple-Redundancy Fallback
 function loadHistory() {
+  // A. Try loading primary file
   try {
     if (fs.existsSync(historyFilePath)) {
-      const content = fs.readFileSync(historyFilePath, 'utf-8');
-      return JSON.parse(content || '[]');
+      const content = fs.readFileSync(historyFilePath, 'utf-8').trim();
+      if (content) {
+        const parsed = JSON.parse(content);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return parsed;
+        }
+      }
     }
   } catch (err) {
-    console.error('Error reading history file:', err);
+    console.error('[STORAGE] Error reading primary history file:', err.message);
   }
+
+  // B. Try loading backup copy
+  try {
+    if (fs.existsSync(backupFilePath)) {
+      const backupContent = fs.readFileSync(backupFilePath, 'utf-8').trim();
+      if (backupContent) {
+        const parsed = JSON.parse(backupContent);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          console.log('[STORAGE] Recovered history from backup copy!');
+          // Restore primary from backup
+          try { fs.writeFileSync(historyFilePath, backupContent, 'utf-8'); } catch (e) {}
+          return parsed;
+        }
+      }
+    }
+  } catch (bErr) {
+    console.error('[STORAGE] Error reading backup copy:', bErr.message);
+  }
+
+  // C. Scan individual session files in data/sessions/
+  try {
+    if (fs.existsSync(sessionsDir)) {
+      const sessionFiles = fs.readdirSync(sessionsDir).filter(f => f.endsWith('.json') && f !== 'active-session.json');
+      if (sessionFiles.length > 0) {
+        const recovered = [];
+        for (const file of sessionFiles) {
+          try {
+            const raw = fs.readFileSync(path.join(sessionsDir, file), 'utf-8');
+            const entry = JSON.parse(raw);
+            if (entry && entry.id) recovered.push(entry);
+          } catch (e) {}
+        }
+        if (recovered.length > 0) {
+          // Sort latest first
+          recovered.sort((a, b) => (new Date(b.concludedAt || b.endedAt || 0)) - (new Date(a.concludedAt || a.endedAt || 0)));
+          console.log(`[STORAGE] Recovered ${recovered.length} session(s) from sessions directory!`);
+          saveHistory(recovered);
+          return recovered;
+        }
+      }
+    }
+  } catch (sErr) {
+    console.error('[STORAGE] Error scanning session files:', sErr.message);
+  }
+
   return [];
 }
 
+// 2. Atomic Disk Writer (Prevents file corruption if process crashes mid-write)
 function saveHistory(historyList) {
+  if (!Array.isArray(historyList)) return false;
   try {
-    fs.writeFileSync(historyFilePath, JSON.stringify(historyList, null, 2), 'utf-8');
+    const dataStr = JSON.stringify(historyList, null, 2);
+    const tmpFile = `${historyFilePath}.${Date.now()}.tmp`;
+
+    // Write to temp file first
+    fs.writeFileSync(tmpFile, dataStr, 'utf-8');
+    // Atomic rename
+    fs.renameSync(tmpFile, historyFilePath);
+
+    // Write redundant backup copy
+    try {
+      fs.writeFileSync(backupFilePath, dataStr, 'utf-8');
+    } catch (bErr) {}
+
     return true;
   } catch (err) {
-    console.error('Error writing history file:', err);
-    return false;
+    console.error('[STORAGE] Error writing atomic history file:', err);
+    try {
+      // Direct write fallback
+      fs.writeFileSync(historyFilePath, JSON.stringify(historyList, null, 2), 'utf-8');
+      return true;
+    } catch (fallbackErr) {
+      console.error('[STORAGE] Fatal write failure:', fallbackErr);
+      return false;
+    }
   }
 }
 
-// Helper: Archive Current Exam Session with all student responses
+// 3. Persist Active Live State to Disk (For Instant Crash/Restart Recovery)
+function persistActiveSessionToDisk() {
+  try {
+    const payload = {
+      examState,
+      students,
+      updatedAt: Date.now()
+    };
+    const tmp = `${activeSessionFilePath}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2), 'utf-8');
+    fs.renameSync(tmp, activeSessionFilePath);
+  } catch (err) {
+    console.error('[STORAGE] Error persisting active session:', err.message);
+  }
+}
+
+// 4. Archive Exam Session (Roll-Number Deduplication & Non-Destructive Merging)
 function archiveCurrentExamSession(reason = 'Exam concluded') {
   const studentList = Object.values(students);
-  if (studentList.length === 0 && !examState.pdfUrl) {
+  if (studentList.length === 0 && !examState.pdfUrl && examState.status === 'idle') {
     return null;
   }
 
   const history = loadHistory();
   const sessionId = examState.sessionId || `exam-${examState.startTime || Date.now()}`;
+  if (!examState.sessionId) {
+    examState.sessionId = sessionId;
+  }
 
-  const formattedStudents = studentList.map(s => ({
-    socketId: s.socketId,
-    name: s.name,
-    rollNo: s.rollNo,
-    status: s.status,
-    answers: s.answers || {},
-    answeredCount: Object.values(s.answers || {}).filter(a => a && a.trim().length > 0).length,
-    outDurationSeconds: (s.outDurationSeconds || 0) + (s.liveAwaySeconds || 0),
-    violations: s.violations || [],
-    submittedAt: s.submittedAt || (s.status === 'submitted' ? 'Submitted' : (examState.status === 'ended' ? 'Concluded' : 'In Progress')),
-    joinedAt: s.joinedAt
-  }));
+  // Find existing session entry in history
+  const existingIdx = history.findIndex(h => h.id === sessionId);
+  const existingEntry = existingIdx >= 0 ? history[existingIdx] : null;
+
+  // Student master map keyed by rollNo
+  const studentsMap = {};
+
+  // Step A: Load all previously archived students for this session (prevents data wipe on roster clear!)
+  if (existingEntry && Array.isArray(existingEntry.students)) {
+    for (const s of existingEntry.students) {
+      const key = (s.rollNo || s.socketId || '').trim().toLowerCase();
+      if (key) {
+        studentsMap[key] = {
+          ...s,
+          answers: { ...(s.answers || {}) },
+          violations: [...(s.violations || [])]
+        };
+      }
+    }
+  }
+
+  // Step B: Merge in currently active students (latest answers, updated durations)
+  for (const s of studentList) {
+    const key = (s.rollNo || s.socketId || '').trim().toLowerCase();
+    if (!key) continue;
+
+    const existing = studentsMap[key];
+    const liveAway = s.liveAwaySeconds || 0;
+    const totalAway = (s.outDurationSeconds || 0) + liveAway;
+    const currentAnswers = s.answers || {};
+
+    if (!existing) {
+      studentsMap[key] = {
+        socketId: s.socketId,
+        name: s.name,
+        rollNo: s.rollNo,
+        status: s.status,
+        answers: { ...currentAnswers },
+        answeredCount: Object.values(currentAnswers).filter(a => a && a.trim().length > 0).length,
+        outDurationSeconds: totalAway,
+        violations: [...(s.violations || [])],
+        submittedAt: s.submittedAt || (s.status === 'submitted' ? 'Submitted' : (examState.status === 'ended' ? 'Concluded' : 'In Progress')),
+        joinedAt: s.joinedAt
+      };
+    } else {
+      // Non-destructive answer merge: NEVER wipe a previously answered question!
+      const mergedAnswers = { ...(existing.answers || {}) };
+      for (const [qNum, ans] of Object.entries(currentAnswers)) {
+        if (ans !== undefined && ans !== null && ans !== '') {
+          mergedAnswers[qNum] = ans;
+        } else if (!mergedAnswers[qNum]) {
+          mergedAnswers[qNum] = ans || '';
+        }
+      }
+
+      // Merge violation logs uniquely
+      const mergedViolations = [...(existing.violations || [])];
+      for (const v of (s.violations || [])) {
+        if (!mergedViolations.some(mv => mv.time === v.time && mv.type === v.type)) {
+          mergedViolations.push(v);
+        }
+      }
+
+      const isSub = s.status === 'submitted' || existing.status === 'submitted';
+
+      studentsMap[key] = {
+        socketId: s.socketId || existing.socketId,
+        name: s.name || existing.name,
+        rollNo: s.rollNo || existing.rollNo,
+        status: isSub ? 'submitted' : s.status,
+        answers: mergedAnswers,
+        answeredCount: Object.values(mergedAnswers).filter(a => a && a.trim().length > 0).length,
+        outDurationSeconds: Math.max(existing.outDurationSeconds || 0, totalAway),
+        violations: mergedViolations,
+        submittedAt: s.submittedAt || existing.submittedAt || (isSub ? 'Submitted' : (examState.status === 'ended' ? 'Concluded' : 'In Progress')),
+        joinedAt: existing.joinedAt || s.joinedAt
+      };
+    }
+  }
+
+  const finalStudentsList = Object.values(studentsMap);
 
   const historyEntry = {
     id: sessionId,
-    title: examState.title || 'General Assessment',
-    subject: examState.subject || '',
-    examCode: examState.examCode || 'EXAM101',
-    totalQuestions: examState.totalQuestions || 10,
-    durationMinutes: examState.durationMinutes || 60,
-    pdfFileName: examState.pdfFileName || '',
-    pdfUrl: examState.pdfUrl || '',
-    startTime: examState.startTime,
-    endTime: examState.endTime,
-    endedAt: new Date().toISOString(),
-    formattedDate: new Date().toLocaleString('en-US', {
+    title: examState.title || existingEntry?.title || 'General Assessment',
+    subject: examState.subject || existingEntry?.subject || '',
+    examCode: examState.examCode || existingEntry?.examCode || 'EXAM101',
+    totalQuestions: examState.totalQuestions || existingEntry?.totalQuestions || 10,
+    durationMinutes: examState.durationMinutes || existingEntry?.durationMinutes || 60,
+    pdfFileName: examState.pdfFileName || existingEntry?.pdfFileName || '',
+    pdfUrl: examState.pdfUrl || existingEntry?.pdfUrl || '',
+    startTime: examState.startTime || existingEntry?.startTime,
+    endTime: examState.endTime || existingEntry?.endTime,
+    endedAt: examState.status === 'ended' ? (existingEntry?.endedAt || new Date().toISOString()) : (existingEntry?.endedAt || null),
+    concludedAt: existingEntry?.concludedAt || new Date().toISOString(),
+    formattedDate: existingEntry?.formattedDate || new Date().toLocaleString('en-US', {
       year: 'numeric',
       month: 'short',
       day: 'numeric',
@@ -100,12 +270,11 @@ function archiveCurrentExamSession(reason = 'Exam concluded') {
       minute: '2-digit'
     }),
     reason: reason,
-    totalStudents: formattedStudents.length,
-    submittedCount: formattedStudents.filter(s => s.status === 'submitted' || s.submittedAt).length,
-    students: formattedStudents
+    totalStudents: finalStudentsList.length,
+    submittedCount: finalStudentsList.filter(s => s.status === 'submitted' || s.submittedAt).length,
+    students: finalStudentsList
   };
 
-  const existingIdx = history.findIndex(h => h.id === sessionId);
   if (existingIdx >= 0) {
     history[existingIdx] = historyEntry;
   } else {
@@ -113,6 +282,15 @@ function archiveCurrentExamSession(reason = 'Exam concluded') {
   }
 
   saveHistory(history);
+
+  // Per-Session Backup File
+  try {
+    const sessionFile = path.join(sessionsDir, `${sessionId}.json`);
+    fs.writeFileSync(sessionFile, JSON.stringify(historyEntry, null, 2), 'utf-8');
+  } catch (e) {
+    console.error('[STORAGE] Error writing individual session backup file:', e.message);
+  }
+
   return historyEntry;
 }
 
@@ -172,6 +350,23 @@ let examState = {
 
 // Connected Students Store: { socketId: { id, name, rollNo, status, inFullscreen, outDurationSeconds, violations: [], answers: {}, answeredCount: 0, joinedAt } }
 let students = {};
+
+// Disaster Recovery: Restore active exam session on server reboot if exists
+try {
+  if (fs.existsSync(activeSessionFilePath)) {
+    const rawActive = fs.readFileSync(activeSessionFilePath, 'utf-8').trim();
+    if (rawActive) {
+      const activeData = JSON.parse(rawActive);
+      if (activeData && activeData.examState && (activeData.examState.status === 'active' || activeData.examState.status === 'created')) {
+        examState = { ...examState, ...activeData.examState };
+        students = activeData.students || {};
+        console.log(`[RECOVERY] Restored active exam "${examState.title}" with ${Object.keys(students).length} students from disk!`);
+      }
+    }
+  }
+} catch (recErr) {
+  console.error('[RECOVERY] Failed to restore active session:', recErr.message);
+}
 
 // Helper: Authentication Middleware for Teacher
 function requireTeacherAuth(req, res, next) {
@@ -234,6 +429,9 @@ app.post('/api/teacher/exam', requireTeacherAuth, upload.single('examPdf'), (req
     examState.startTime = null;
     examState.endTime = null;
 
+    // Persist to disk
+    persistActiveSessionToDisk();
+
     // Notify all connected sockets of state update
     io.emit('exam:updated', examState);
 
@@ -258,6 +456,9 @@ app.post('/api/teacher/exam/start', requireTeacherAuth, (req, res) => {
   examState.startTime = now;
   examState.endTime = now + durationMs;
 
+  persistActiveSessionToDisk();
+  archiveCurrentExamSession('Exam commenced');
+
   io.emit('exam:started', {
     ...examState,
     serverTime: now
@@ -272,6 +473,7 @@ app.post('/api/teacher/exam/end', requireTeacherAuth, (req, res) => {
 
   // Save the complete session with all student responses to history
   const archived = archiveCurrentExamSession('Concluded by examiner');
+  persistActiveSessionToDisk();
 
   io.emit('exam:ended', { message: 'The exam has been concluded by the examiner.' });
   if (archived) {
@@ -432,8 +634,98 @@ app.delete('/api/teacher/history/:id', requireTeacherAuth, (req, res) => {
   history = history.filter(h => h.id !== req.params.id);
   saveHistory(history);
 
+  // Also remove individual session file if exists
+  try {
+    const sFile = path.join(sessionsDir, `${req.params.id}.json`);
+    if (fs.existsSync(sFile)) fs.unlinkSync(sFile);
+  } catch (e) {}
+
   io.to('teachers_room').emit('teacher:history_updated', history);
   res.json({ success: true, deleted: initialLen > history.length });
+});
+
+// Teacher: Download Full Permanent History Backup (JSON file)
+app.get('/api/teacher/history/backup-json', requireTeacherAuth, (req, res) => {
+  const history = loadHistory();
+  const jsonContent = JSON.stringify(history, null, 2);
+  const filename = `proctorlock-exam-history-backup-${Date.now()}.json`;
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.status(200).send(jsonContent);
+});
+
+// Teacher: Restore / Import History from Client Backup or File
+app.post('/api/teacher/history/restore-backup', requireTeacherAuth, (req, res) => {
+  try {
+    const { history: importedHistory } = req.body;
+    if (!Array.isArray(importedHistory)) {
+      return res.status(400).json({ success: false, error: 'Invalid history payload. Array expected.' });
+    }
+
+    const currentHistory = loadHistory();
+    const historyMap = {};
+
+    // 1. Index existing history
+    for (const h of currentHistory) {
+      if (h && h.id) historyMap[h.id] = h;
+    }
+
+    // 2. Non-destructively merge incoming records
+    let addedCount = 0;
+    for (const h of importedHistory) {
+      if (h && h.id) {
+        if (!historyMap[h.id]) {
+          historyMap[h.id] = h;
+          addedCount++;
+        } else {
+          // Merge students inside session
+          const existingStudents = historyMap[h.id].students || [];
+          const incomingStudents = h.students || [];
+          const sMap = {};
+          for (const s of existingStudents) {
+            const k = (s.rollNo || s.socketId || '').trim().toLowerCase();
+            if (k) sMap[k] = s;
+          }
+          for (const s of incomingStudents) {
+            const k = (s.rollNo || s.socketId || '').trim().toLowerCase();
+            if (k) {
+              if (!sMap[k]) {
+                sMap[k] = s;
+              } else {
+                // Merge answers
+                sMap[k].answers = { ...(sMap[k].answers || {}), ...(s.answers || {}) };
+                sMap[k].answeredCount = Object.values(sMap[k].answers).filter(a => a && a.trim().length > 0).length;
+              }
+            }
+          }
+          historyMap[h.id].students = Object.values(sMap);
+          historyMap[h.id].totalStudents = historyMap[h.id].students.length;
+        }
+      }
+    }
+
+    const mergedList = Object.values(historyMap);
+    // Sort latest first
+    mergedList.sort((a, b) => (new Date(b.concludedAt || b.endedAt || 0)) - (new Date(a.concludedAt || a.endedAt || 0)));
+
+    saveHistory(mergedList);
+
+    // Save individual session backup files
+    for (const entry of mergedList) {
+      try {
+        const sFile = path.join(sessionsDir, `${entry.id}.json`);
+        fs.writeFileSync(sFile, JSON.stringify(entry, null, 2), 'utf-8');
+      } catch (e) {}
+    }
+
+    io.to('teachers_room').emit('teacher:history_updated', mergedList);
+    console.log(`[STORAGE] Restored/merged history: ${mergedList.length} total sessions (${addedCount} new).`);
+
+    res.json({ success: true, count: mergedList.length, added: addedCount, history: mergedList });
+  } catch (err) {
+    console.error('Failed to restore backup:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // Teacher: Manually Archive Current Session Now
@@ -476,6 +768,7 @@ app.post('/api/teacher/students/clear-inactive', requireTeacherAuth, (req, res) 
 
   // WIPE ALL STUDENT SESSIONS COMPLETELY
   students = {};
+  persistActiveSessionToDisk();
 
   // Broadcast empty roster to teachers and refresh history list
   io.to('teachers_room').emit('teacher:students_update', []);
@@ -499,6 +792,19 @@ app.use('/api', (req, res) => {
   res.status(404).json({ success: false, error: `Endpoint not found: ${req.method} ${req.originalUrl}` });
 });
 
+// Live continuous auto-sync to disk
+let liveHistorySyncTimer = null;
+function scheduleLiveHistorySync() {
+  if (liveHistorySyncTimer) return;
+  liveHistorySyncTimer = setTimeout(() => {
+    liveHistorySyncTimer = null;
+    try {
+      persistActiveSessionToDisk();
+      archiveCurrentExamSession('Live continuous auto-save');
+    } catch (e) {}
+  }, 1000);
+}
+
 // ========================
 // REAL-TIME SOCKET.IO LOGIC
 // ========================
@@ -519,32 +825,69 @@ io.on('connection', (socket) => {
       } catch (e) {}
     }
     students = {};
+    persistActiveSessionToDisk();
     io.to('teachers_room').emit('teacher:students_update', []);
   });
 
-  // Student joining test room
+  // Student joining test room (Roll-number based lookup & seamless reconnection)
   socket.on('student:join', (data) => {
     const { name, rollNo, examCode } = data;
+    const cleanName = (name || '').trim();
+    const cleanRoll = (rollNo || '').trim();
 
     // Validate exam code
     if (examState.examCode && examCode && examCode.toUpperCase().trim() !== examState.examCode) {
       return socket.emit('student:join_error', { message: 'Invalid Exam Code. Please verify with your teacher.' });
     }
 
-    students[socket.id] = {
-      socketId: socket.id,
-      name: name.trim(),
-      rollNo: rollNo.trim(),
-      status: examState.status === 'active' ? 'in_test' : 'waiting',
-      inFullscreen: false,
-      outOfFullscreenSince: null,
-      outDurationSeconds: 0,
-      violations: [],
-      answers: {},
-      answeredCount: 0,
-      submittedAt: null,
-      joinedAt: new Date().toLocaleTimeString()
-    };
+    // Check if this student is already registered by rollNo
+    let existingSocketId = null;
+    let existingStudent = null;
+
+    for (const [sId, s] of Object.entries(students)) {
+      if (s.rollNo && s.rollNo.toLowerCase() === cleanRoll.toLowerCase()) {
+        existingSocketId = sId;
+        existingStudent = s;
+        break;
+      }
+    }
+
+    if (existingStudent) {
+      // Reconnecting student! Clean up old socket key and preserve all answers & progress
+      if (existingSocketId !== socket.id) {
+        delete students[existingSocketId];
+      }
+      existingStudent.socketId = socket.id;
+      existingStudent.name = cleanName || existingStudent.name;
+      existingStudent.status = existingStudent.status === 'submitted' ? 'submitted' : (examState.status === 'active' ? 'in_test' : 'waiting');
+      existingStudent.inFullscreen = false;
+      existingStudent.outOfFullscreenSince = null;
+      students[socket.id] = existingStudent;
+    } else {
+      // Check if student existed in current session archive
+      const history = loadHistory();
+      const currentArchive = history.find(h => h.id === examState.sessionId);
+      const archivedStudent = currentArchive ? (currentArchive.students || []).find(s => s.rollNo && s.rollNo.toLowerCase() === cleanRoll.toLowerCase()) : null;
+
+      students[socket.id] = {
+        socketId: socket.id,
+        name: cleanName,
+        rollNo: cleanRoll,
+        status: archivedStudent?.status === 'submitted' ? 'submitted' : (examState.status === 'active' ? 'in_test' : 'waiting'),
+        inFullscreen: false,
+        outOfFullscreenSince: null,
+        outDurationSeconds: archivedStudent?.outDurationSeconds || 0,
+        violations: archivedStudent?.violations ? [...archivedStudent.violations] : [],
+        answers: archivedStudent?.answers ? { ...archivedStudent.answers } : {},
+        answeredCount: archivedStudent?.answeredCount || 0,
+        submittedAt: archivedStudent?.submittedAt || null,
+        joinedAt: archivedStudent?.joinedAt || new Date().toLocaleTimeString()
+      };
+    }
+
+    // Persist active state to disk immediately
+    persistActiveSessionToDisk();
+    archiveCurrentExamSession('Student joined');
 
     socket.join('students_room');
     socket.emit('student:joined_success', {
@@ -555,10 +898,11 @@ io.on('connection', (socket) => {
 
     // Notify teachers
     io.to('teachers_room').emit('teacher:students_update', Object.values(students));
+    io.to('teachers_room').emit('teacher:history_updated', loadHistory());
     io.to('teachers_room').emit('teacher:new_notification', {
       type: 'info',
       title: 'Student Joined',
-      message: `${name} (${rollNo}) joined the room.`,
+      message: `${cleanName} (${cleanRoll}) joined the room.`,
       timestamp: new Date().toLocaleTimeString()
     });
   });
@@ -646,7 +990,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Student updates/saves an answer (auto-save draft)
+  // Student updates/saves an answer (auto-save draft & live disk persistence)
   socket.on('student:save_answer', (data) => {
     const student = students[socket.id];
     if (!student) return;
@@ -656,11 +1000,14 @@ io.on('connection', (socket) => {
     student.answers[questionNumber] = answer;
     student.answeredCount = Object.values(student.answers).filter(a => a && a.trim().length > 0).length;
 
+    // Trigger continuous background auto-save to disk
+    scheduleLiveHistorySync();
+
     // Notify teacher of answering progress
     io.to('teachers_room').emit('teacher:students_update', Object.values(students));
   });
 
-  // Student submits exam
+  // Student submits exam (Immediate Disk Archival Guaranteed)
   socket.on('student:submit_exam', (data) => {
     const student = students[socket.id];
     if (!student) return;
@@ -679,11 +1026,10 @@ io.on('connection', (socket) => {
       student.outOfFullscreenSince = null;
     }
 
-    // Auto-update history archive if exam is ended
-    if (examState.status === 'ended') {
-      archiveCurrentExamSession('Exam concluded');
-      io.to('teachers_room').emit('teacher:history_updated', loadHistory());
-    }
+    // ALWAYS archive immediately on student submission, regardless of exam status!
+    persistActiveSessionToDisk();
+    archiveCurrentExamSession('Student submission');
+    io.to('teachers_room').emit('teacher:history_updated', loadHistory());
 
     io.to('teachers_room').emit('teacher:students_update', Object.values(students));
     io.to('teachers_room').emit('teacher:new_notification', {

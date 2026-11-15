@@ -289,6 +289,20 @@ function buildAnswerInterface(totalQuestions) {
     answerSheetTotalQs.textContent = `${totalQuestions} Questions`;
   }
 
+  // Load any previously saved draft from localStorage or server payload
+  const localDraftKey = `PROCTOR_DRAFT_${currentExamState?.examCode || 'EXAM'}_${currentStudent?.rollNo || 'ANON'}`;
+  let localDraft = {};
+  try {
+    const raw = localStorage.getItem(localDraftKey);
+    if (raw) localDraft = JSON.parse(raw);
+  } catch (e) {}
+
+  studentAnswers = {
+    ...localDraft,
+    ...(currentStudent?.answers || {}),
+    ...studentAnswers
+  };
+
   if (questionJumpChips) {
     questionJumpChips.innerHTML = '';
   }
@@ -297,11 +311,16 @@ function buildAnswerInterface(totalQuestions) {
   }
 
   for (let i = 1; i <= totalQuestions; i++) {
+    const existingVal = studentAnswers[i] || '';
+    const hasInitialAnswer = existingVal.trim().length > 0;
+
     // 1. Navigation Chip
     const chip = document.createElement('button');
     chip.type = 'button';
     chip.id = `chip-q-${i}`;
-    chip.className = 'px-2.5 py-1 rounded-md text-[11px] font-mono font-bold bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white border border-slate-700 transition-all shrink-0 cursor-pointer';
+    chip.className = hasInitialAnswer 
+      ? 'px-2.5 py-1 rounded-md text-[11px] font-mono font-bold bg-emerald-600 text-white border border-emerald-500 shadow-sm shadow-emerald-500/20 transition-all shrink-0 cursor-pointer'
+      : 'px-2.5 py-1 rounded-md text-[11px] font-mono font-bold bg-slate-800 text-slate-400 hover:bg-slate-700 hover:text-white border border-slate-700 transition-all shrink-0 cursor-pointer';
     chip.textContent = `Q${i}`;
     chip.onclick = () => jumpToQuestion(i);
     if (questionJumpChips) questionJumpChips.appendChild(chip);
@@ -316,8 +335,8 @@ function buildAnswerInterface(totalQuestions) {
           <span class="w-5 h-5 rounded-md bg-indigo-600/30 text-indigo-400 flex items-center justify-center text-[10px] font-mono font-bold">Q${i}</span>
           <span>Question ${i}</span>
         </label>
-        <span id="save-status-${i}" class="text-[10px] font-medium text-slate-500">
-          Pending
+        <span id="save-status-${i}" class="text-[10px] font-medium ${hasInitialAnswer ? 'text-emerald-400' : 'text-slate-500'}">
+          ${hasInitialAnswer ? '<span class="text-emerald-400 font-semibold flex items-center space-x-1"><i class="fa-solid fa-check text-[9px]"></i><span>Saved</span></span>' : 'Pending'}
         </span>
       </div>
       <textarea
@@ -325,7 +344,7 @@ function buildAnswerInterface(totalQuestions) {
         rows="3"
         placeholder="Type answer for Question ${i} (numeric or text)..."
         class="w-full p-2.5 rounded-lg bg-slate-950 border border-slate-800 text-slate-100 placeholder-slate-600 font-mono text-xs focus:outline-none focus:border-indigo-500 transition-all resize-y select-text"
-      >${studentAnswers[i] || ''}</textarea>
+      >${existingVal}</textarea>
     `;
 
     if (answersInputsContainer) answersInputsContainer.appendChild(card);
@@ -343,6 +362,12 @@ function buildAnswerInterface(totalQuestions) {
 function handleAnswerInput(qNum, value) {
   studentAnswers[qNum] = value;
   const isAnswered = value && value.trim().length > 0;
+
+  // Save to student local storage immediately
+  try {
+    const localDraftKey = `PROCTOR_DRAFT_${currentExamState?.examCode || 'EXAM'}_${currentStudent?.rollNo || 'ANON'}`;
+    localStorage.setItem(localDraftKey, JSON.stringify(studentAnswers));
+  } catch (e) {}
 
   // Update chip styling
   const chip = document.getElementById(`chip-q-${qNum}`);
@@ -368,7 +393,7 @@ function handleAnswerInput(qNum, value) {
   const totalQuestions = currentExamState?.totalQuestions || 10;
   updateAnswerProgress(totalQuestions);
 
-  // Auto-save draft over WebSockets (debounced 400ms)
+  // Auto-save draft over WebSockets (debounced 300ms)
   clearTimeout(saveAnswerDebounceTimers[qNum]);
   saveAnswerDebounceTimers[qNum] = setTimeout(() => {
     if (socket) {
@@ -377,7 +402,7 @@ function handleAnswerInput(qNum, value) {
         answer: value
       });
     }
-  }, 400);
+  }, 300);
 }
 
 function updateAnswerProgress(totalQuestions) {
