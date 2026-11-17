@@ -83,3 +83,13 @@
   background-color: #000000;
   z-index: 999999;
 }
+
+@media (max-width: 767px) {
+  #workspace-container { overflow-y: auto; }
+  #pdf-scroll-container { height: 52vh; min-height: 250px; flex-shrink: 0; }
+  #answers-pane-container { height: 48vh; min-height: 280px; flex-shrink: 0; }
+  #pdf-scroll-container.w-full:only-child { height: 100%; }
+  #exam-action-buttons { flex-wrap: wrap; gap: 8px; }
+  #exam-action-buttons button { padding: 10px; }
+  #dashboard-container header > div { flex-wrap: wrap; gap: 8px; }
+}

@@ -64,6 +64,9 @@ const closeAnswersModalBtn = document.getElementById('close-answers-modal-btn');
 // Exam History Elements & State
 let examHistoryList = [];
 let currentPastExam = null;
+let historyReady = false;
+let pendingHistory = null;
+let historyLoading = false;
 
 const examHistoryBody = document.getElementById('exam-history-body');
 const historyCountBadge = document.getElementById('history-count-badge');
@@ -114,6 +117,8 @@ function showLogin() {
 }
 
 function showDashboard() {
+  historyReady = false;
+  pendingHistory = null;
   loginContainer.classList.add('hidden');
   dashboardContainer.classList.remove('hidden');
   initSocket();
@@ -150,6 +155,7 @@ loginForm.addEventListener('submit', async (e) => {
 logoutBtn.addEventListener('click', async () => {
   await fetch('/api/teacher/logout', { method: 'POST' });
   if (socket) socket.disconnect();
+  socket = null;
   showLogin();
 });
 
@@ -169,9 +175,16 @@ function initSocket() {
   if (socket) return;
 
   socket = io();
+  socket.on('teacher:auth_error', () => {
+    socket.disconnect(); socket = null; showLogin();
+  });
+  socket.on('operation:error', data => alert(data.message));
 
   socket.on('connect', () => {
+    historyReady = false;
+    pendingHistory = null;
     socket.emit('teacher:join');
+    fetchExamHistory();
   });
 
   socket.on('exam:state_sync', (state) => {
@@ -207,7 +220,9 @@ function initSocket() {
 
   socket.on('teacher:history_updated', (historyData) => {
     const list = Array.isArray(historyData) ? historyData : (historyData?.history || []);
-    renderExamHistory(list);
+    // Initial empty sync must not overwrite the only surviving browser backup.
+    if (!historyReady) pendingHistory = list;
+    else renderExamHistory(list);
   });
 
   socket.on('teacher:new_notification', (notif) => {
@@ -230,12 +245,13 @@ function updateExamUI(state) {
   displayShareCode.textContent = state.examCode || 'EXAM101';
 
   if (state.pdfFileName) {
-    currentPdfStatus.innerHTML = `<span class="text-emerald-400 font-semibold"><i class="fa-solid fa-file-pdf mr-1"></i> ${state.pdfFileName}</span>`;
+    currentPdfStatus.textContent = state.pdfFileName;
   } else {
     currentPdfStatus.textContent = 'No PDF uploaded yet';
   }
 
   const questionsCount = state.totalQuestions || 10;
+  for (const control of examConfigForm.elements) control.disabled = state.status === 'active';
 
   // Update status badge
   if (state.status === 'active') {
@@ -377,8 +393,9 @@ endExamBtn.addEventListener('click', async () => {
 
 // Render Real-time Student Roster Table
 function renderStudentsRoster() {
-  rosterCount.textContent = `${studentsList.length} Connected`;
-  kpiTotalStudents.textContent = studentsList.length;
+  const connectedCount = studentsList.filter(s => s.connected).length;
+  rosterCount.textContent = `${connectedCount} Connected · ${studentsList.length} Registered`;
+  kpiTotalStudents.textContent = connectedCount;
 
   let inFullCount = 0;
   let outFullCount = 0;
@@ -390,7 +407,7 @@ function renderStudentsRoster() {
         <td colspan="7" class="py-12 text-center text-slate-500 text-sm">
           <i class="fa-regular fa-folder-open text-3xl mb-3 block text-slate-600"></i>
           No students have joined this test room yet.<br>
-          <span class="text-xs text-slate-600">Share Exam Code <strong class="text-slate-400">${currentExamState?.examCode || 'EXAM101'}</strong> with students.</span>
+          <span class="text-xs text-slate-600">Share Exam Code <strong class="text-slate-400">${escapeHtml(currentExamState?.examCode || 'EXAM101')}</strong> with students.</span>
         </td>
       </tr>
     `;
@@ -417,6 +434,8 @@ function renderStudentsRoster() {
     let fullscreenBadge = '';
     if (student.status === 'submitted') {
       fullscreenBadge = `<span class="px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700">Exam Submitted</span>`;
+    } else if (student.status === 'waiting' || student.status === 'disconnected') {
+      fullscreenBadge = '<span class="text-slate-500">Not in exam</span>';
     } else if (student.inFullscreen) {
       fullscreenBadge = `<span class="px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 flex items-center w-fit space-x-1.5"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span><span>In Fullscreen</span></span>`;
     } else {
@@ -443,8 +462,8 @@ function renderStudentsRoster() {
     tr.className = 'hover:bg-slate-800/40 transition-colors';
     tr.innerHTML = `
       <td class="py-3 px-3">
-        <div class="font-bold text-white">${student.name}</div>
-        <div class="text-[11px] font-mono text-slate-400">Roll: ${student.rollNo}</div>
+        <div class="font-bold text-white">${escapeHtml(student.name)}</div>
+        <div class="text-[11px] font-mono text-slate-400">Roll: ${escapeHtml(student.rollNo)}</div>
       </td>
       <td class="py-3 px-3">${statusBadge}</td>
       <td class="py-3 px-3">${fullscreenBadge}</td>
@@ -462,20 +481,24 @@ function renderStudentsRoster() {
         </span>
       </td>
       <td class="py-3 px-3 text-right space-x-1.5">
-        <button onclick="viewStudentAnswers('${student.socketId}', '${student.rollNo}')" class="px-2 py-1 rounded bg-indigo-900/40 hover:bg-indigo-800 text-indigo-300 hover:text-white text-[11px] border border-indigo-800/50 transition-colors cursor-pointer" title="Review answers submitted by student">
+        <button data-action="answers" class="px-2 py-1 rounded bg-indigo-900/40 hover:bg-indigo-800 text-indigo-300 hover:text-white text-[11px] border border-indigo-800/50 transition-colors cursor-pointer" title="Review answers submitted by student">
           <i class="fa-solid fa-file-pen mr-1"></i> Answers
         </button>
-        <button onclick="inspectStudent('${student.socketId}')" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-[11px] border border-slate-700 transition-colors" title="Audit integrity logs">
+        <button data-action="audit" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-[11px] border border-slate-700 transition-colors" title="Audit integrity logs">
           <i class="fa-solid fa-shield-halved mr-1"></i> Audit
         </button>
         ${student.status === 'in_test' ? `
-          <button onclick="forceSubmitStudent('${student.socketId}', '${student.name}')" class="px-2 py-1 rounded bg-rose-900/40 hover:bg-rose-800 text-rose-300 hover:text-white text-[11px] border border-rose-800/50 transition-colors" title="Force submit exam">
+          <button data-action="terminate" class="px-2 py-1 rounded bg-rose-900/40 hover:bg-rose-800 text-rose-300 hover:text-white text-[11px] border border-rose-800/50 transition-colors" title="Force submit exam">
             <i class="fa-solid fa-ban mr-1"></i> Terminate
           </button>
         ` : ''}
       </td>
     `;
     studentRosterBody.appendChild(tr);
+    tr.querySelector('[data-action="answers"]').onclick = () => viewStudentAnswers(student.socketId, student.rollNo);
+    tr.querySelector('[data-action="audit"]').onclick = () => inspectStudent(student.socketId);
+    const terminate = tr.querySelector('[data-action="terminate"]');
+    if (terminate) terminate.onclick = () => forceSubmitStudent(student.socketId, student.name);
   });
 
   kpiInFullscreen.textContent = inFullCount;
@@ -508,11 +531,11 @@ function addFeedNotification(notif) {
     <div class="flex items-center justify-between">
       <div class="flex items-center space-x-1.5 font-bold text-white">
         <i class="${iconClass}"></i>
-        <span>${notif.title || 'Security Event'}</span>
+        <span>${escapeHtml(notif.title || 'Security Event')}</span>
       </div>
-      <span class="text-[10px] font-mono text-slate-500">${timestamp}</span>
+      <span class="text-[10px] font-mono text-slate-500">${escapeHtml(timestamp)}</span>
     </div>
-    <p class="text-slate-300 text-[11px] leading-relaxed">${notif.message}</p>
+    <p class="text-slate-300 text-[11px] leading-relaxed">${escapeHtml(notif.message)}</p>
   `;
 
   activityFeed.prepend(card);
@@ -541,10 +564,10 @@ window.inspectStudent = function(socketId) {
     modalViolationsList.innerHTML = student.violations.map(v => `
       <div class="p-2.5 rounded-lg bg-slate-800/80 border border-slate-700/60 flex items-center justify-between text-xs">
         <div>
-          <span class="font-semibold text-rose-400">[${v.type}]</span>
-          <span class="text-slate-200 ml-1.5">${v.details}</span>
+          <span class="font-semibold text-rose-400">[${escapeHtml(v.type)}]</span>
+          <span class="text-slate-200 ml-1.5">${escapeHtml(v.details)}</span>
         </div>
-        <span class="text-[10px] font-mono text-slate-400">${v.time}</span>
+        <span class="text-[10px] font-mono text-slate-400">${escapeHtml(v.time)}</span>
       </div>
     `).reverse().join('');
   }
@@ -575,7 +598,7 @@ window.forceSubmitStudent = async function(socketId, name) {
 // Helper: Escape HTML to display student answers safely
 function escapeHtml(text) {
   if (!text) return '';
-  return text
+  return String(text)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -587,15 +610,15 @@ function escapeHtml(text) {
 function displayStudentAnswersModal(student, totalQuestions, examTitle) {
   if (!student) return;
 
-  answersModalStudentName.textContent = `${escapeHtml(student.name || 'Candidate')}'s Answer Sheet`;
-  answersModalStudentMeta.textContent = `Roll No: ${escapeHtml(student.rollNo || '--')} • Status: ${(student.status || 'submitted').toUpperCase()}${student.submittedAt ? ' • Submitted: ' + student.submittedAt : ''}${examTitle ? ' • (' + escapeHtml(examTitle) + ')' : ''}`;
+  answersModalStudentName.textContent = `${student.name || 'Candidate'}'s Answer Sheet`;
+  answersModalStudentMeta.textContent = `Roll No: ${student.rollNo || '--'} • Status: ${(student.status || 'submitted').toUpperCase()}${student.submittedAt ? ' • Submitted: ' + student.submittedAt : ''}${examTitle ? ' • (' + examTitle + ')' : ''}`;
 
   const totalQ = totalQuestions || currentExamState?.totalQuestions || student.totalQuestions || 10;
   const answersObj = student.answers || {};
   const answeredCount = Object.values(answersObj).filter(a => a && a.trim().length > 0).length;
 
   answersModalCount.textContent = `${answeredCount} / ${totalQ} answered`;
-  answersModalAway.textContent = formatDuration(student.outDurationSeconds || 0);
+  answersModalAway.textContent = formatDuration((student.outDurationSeconds || 0) + (student.liveAwaySeconds || 0));
   answersModalFlags.textContent = (student.violations || []).length;
 
   let html = '';
@@ -627,7 +650,7 @@ function displayStudentAnswersModal(student, totalQuestions, examTitle) {
 }
 
 // Open Student Submitted Answers Review Modal (Synchronous, Zero-Latency & Fail-Safe)
-window.viewStudentAnswers = async function(socketId, rollNo) {
+window.viewStudentAnswers = function(socketId, rollNo) {
   try {
     // 1. Instant lookup in active student list (by socketId or rollNo)
     let student = null;
@@ -647,22 +670,6 @@ window.viewStudentAnswers = async function(socketId, rollNo) {
           displayStudentAnswersModal(student, pastExam.totalQuestions || 10, pastExam.title);
           return;
         }
-      }
-    }
-
-    // 3. Fallback: API request if not cached in memory
-    if (!student && socketId) {
-      try {
-        const res = await fetch(`/api/teacher/student-answers/${encodeURIComponent(socketId)}`);
-        const contentType = res.headers.get('content-type') || '';
-        if (res.ok && contentType.includes('application/json')) {
-          const data = await res.json();
-          if (data && data.success && data.student) {
-            student = data.student;
-          }
-        }
-      } catch (fetchErr) {
-        console.warn('API fetch fallback note:', fetchErr);
       }
     }
 
@@ -713,7 +720,7 @@ window.openPastExamModal = function(examId) {
     pastExamMeta.textContent = `Subject: ${exam.subject || 'General Assessment'} • Concluded: ${dateStr} • Reason: ${exam.reason || 'Concluded'}`;
   }
   if (pastExamStudentsCount) pastExamStudentsCount.textContent = (exam.students || []).length;
-  if (pastExamSubmittedCount) pastExamSubmittedCount.textContent = (exam.students || []).filter(s => s.status === 'submitted' || s.submittedAt).length;
+  if (pastExamSubmittedCount) pastExamSubmittedCount.textContent = (exam.students || []).filter(s => s.status === 'submitted').length;
   if (pastExamTotalQuestions) pastExamTotalQuestions.textContent = exam.totalQuestions || 10;
   if (pastExamCode) pastExamCode.textContent = exam.examCode || 'EXAM';
   if (pastExamExportBtn) pastExamExportBtn.href = `/api/teacher/history/${exam.id}/export-csv`;
@@ -732,7 +739,7 @@ window.openPastExamModal = function(examId) {
       let sHtml = '';
       students.forEach((s) => {
         const answeredCount = s.answeredCount !== undefined ? s.answeredCount : (Object.values(s.answers || {}).filter(a => a && a.trim().length > 0).length);
-        const isSub = s.status === 'submitted' || s.submittedAt;
+        const isSub = s.status === 'submitted';
         sHtml += `
           <tr class="hover:bg-slate-800/30 transition-colors">
             <td class="py-2.5 px-3 font-semibold text-white">${escapeHtml(s.name || 'Candidate')}</td>
@@ -754,7 +761,7 @@ window.openPastExamModal = function(examId) {
               </span>
             </td>
             <td class="py-2.5 px-3 text-right">
-              <button onclick="viewPastStudentAnswers('${exam.id}', '${s.rollNo}')" class="px-2 py-1 rounded bg-indigo-900/40 hover:bg-indigo-800 text-indigo-300 hover:text-white text-[11px] border border-indigo-800/50 transition-colors cursor-pointer" title="View submitted answers">
+              <button data-candidate-index="${students.indexOf(s)}" class="px-2 py-1 rounded bg-indigo-900/40 hover:bg-indigo-800 text-indigo-300 hover:text-white text-[11px] border border-indigo-800/50 transition-colors cursor-pointer" title="View submitted answers">
                 <i class="fa-solid fa-file-pen mr-1"></i> Answers
               </button>
             </td>
@@ -762,6 +769,9 @@ window.openPastExamModal = function(examId) {
         `;
       });
       pastExamStudentsBody.innerHTML = sHtml;
+      pastExamStudentsBody.querySelectorAll('[data-candidate-index]').forEach(button => {
+        button.onclick = () => displayStudentAnswersModal(students[Number(button.dataset.candidateIndex)], exam.totalQuestions, exam.title);
+      });
     }
   }
 
@@ -793,8 +803,11 @@ window.deletePastExam = async function(examId) {
 
 // Fetch Exam History from Server with Dual-Sync (Server Disk + Browser LocalStorage)
 async function fetchExamHistory() {
+  if (historyLoading) return;
+  historyLoading = true;
   try {
     const res = await fetch('/api/teacher/history');
+    if (!res.ok) throw new Error('History request failed');
     let serverList = [];
     if (res.ok) {
       const contentType = res.headers.get('content-type') || '';
@@ -805,7 +818,8 @@ async function fetchExamHistory() {
     }
 
     // 1. Read persistent local storage backup from browser
-    const localRaw = localStorage.getItem('PROCTOR_PERMANENT_EXAM_HISTORY');
+    let localRaw = null;
+    try { localRaw = localStorage.getItem('PROCTOR_PERMANENT_EXAM_HISTORY'); } catch {}
     let localList = [];
     try {
       if (localRaw) localList = JSON.parse(localRaw);
@@ -845,7 +859,9 @@ async function fetchExamHistory() {
       localStorage.setItem('PROCTOR_PERMANENT_EXAM_HISTORY', JSON.stringify(finalHistory));
     } catch (e) {}
 
-    renderExamHistory(finalHistory);
+    historyReady = true;
+    renderExamHistory(pendingHistory?.length ? pendingHistory : finalHistory);
+    pendingHistory = null;
   } catch (err) {
     console.error('Failed to fetch exam history from server:', err);
     // Offline fallback: load from browser storage
@@ -855,7 +871,7 @@ async function fetchExamHistory() {
         renderExamHistory(JSON.parse(localRaw));
       }
     } catch (e) {}
-  }
+  } finally { historyLoading = false; }
 }
 
 // Render Past Exam History in Table
@@ -879,7 +895,7 @@ function renderExamHistory(historyList) {
         <td colspan="6" class="py-10 text-center text-slate-500 text-sm">
           <i class="fa-solid fa-box-archive text-3xl mb-3 block text-slate-600"></i>
           No past exam sessions archived yet.<br>
-          <span class="text-xs text-slate-600">When an exam ends or candidates submit, student answer sheets are automatically and permanently saved here.</span>
+          <span class="text-xs text-slate-600">Answer sheets are archived on the server and mirrored in this browser. Download backups to keep an independent copy.</span>
         </td>
       </tr>
     `;
@@ -889,7 +905,7 @@ function renderExamHistory(historyList) {
   let html = '';
   examHistoryList.forEach((exam) => {
     const candidateCount = (exam.students || []).length;
-    const submittedCount = (exam.students || []).filter(s => s.status === 'submitted' || s.submittedAt).length;
+    const submittedCount = (exam.students || []).filter(s => s.status === 'submitted').length;
     const concludedDate = exam.formattedDate || (exam.endedAt ? new Date(exam.endedAt).toLocaleString() : '--');
 
     html += `
@@ -899,7 +915,7 @@ function renderExamHistory(historyList) {
           <div class="text-[11px] font-mono text-slate-400">${escapeHtml(exam.subject || 'General Assessment')} • <span class="text-amber-400 font-semibold">${escapeHtml(exam.examCode || 'EXAM')}</span></div>
         </td>
         <td class="py-3 px-3 text-slate-300 font-mono text-[11px]">
-          ${concludedDate}
+          ${escapeHtml(concludedDate)}
         </td>
         <td class="py-3 px-3 text-center">
           <span class="px-2 py-0.5 rounded-full font-mono text-[11px] font-bold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
@@ -1035,26 +1051,19 @@ if (refreshClearInactiveBtn) {
 
     if (refreshIcon) refreshIcon.classList.add('fa-spin');
 
-    // Immediately vanish local list for instant UI feedback!
-    studentsList = [];
-    renderStudentsRoster();
-
     try {
-      // 1. Emit via socket for instant zero-latency purge across all teacher screens
-      if (socket) {
-        socket.emit('teacher:clear_inactive');
-      }
-
-      // 2. Call backend API to wipe all sessions
-      await fetch('/api/teacher/students/clear-inactive', {
+      const response = await fetch('/api/teacher/students/clear-inactive', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' }
       });
+      if (!response.ok) throw new Error('The roster could not be archived and cleared.');
+      studentsList = []; renderStudentsRoster();
 
       // Refresh exam state and KPI
       fetchExamState();
     } catch (err) {
       console.error('Failed to clear sessions:', err);
+      alert(err.message);
     } finally {
       setTimeout(() => {
         if (refreshIcon) refreshIcon.classList.remove('fa-spin');

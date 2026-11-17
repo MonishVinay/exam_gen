@@ -1,21 +1,28 @@
 {
   "name": "proctor-exam-platform",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "ProctorLock PDF assessments, live integrity monitoring and recoverable submissions",
+  "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test",
+    "check": "node --check server.js && node --check lib/storage.js && node --check public/js/student.js && node --check public/js/teacher.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
+  "engines": {
+    "node": ">=22.22.2"
+  },
   "dependencies": {
-    "cookie-parser": "^1.4.7",
-    "cors": "^2.8.6",
     "express": "^5.3.0",
     "express-session": "^1.19.0",
     "multer": "^2.4.0",
     "socket.io": "^4.8.4"
+  },
+  "devDependencies": {
+    "jsdom": "^31.0.1",
+    "socket.io-client": "^4.8.4"
   }
 }

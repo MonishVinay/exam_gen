@@ -1,84 +1,67 @@
-# 🛡️ ProctorLock - Online Assessment & Proctoring System
+# ProctorLock
 
-A modern, lightweight proctoring platform designed for online tests and exams (inspired by HackerRank/Mettl). Built for 1-click deployment on **Render**, **Railway**, or any Node.js environment.
+PDF assessments with a live examiner console, candidate answer workspace, browser integrity signals and recoverable submissions. Node.js, Express 5, Socket.IO and vanilla JavaScript; the existing GitHub-to-Render deployment is retained.
 
----
+## Run
 
-## 🌟 Key Features
+Use Node.js 22.22.2 or a newer supported LTS version.
 
-### 👨‍🏫 Teacher / Examiner Console (`/teacher.html`)
-- **Password-Protected Authentication:** Secure access controlled via `TEACHER_PASSWORD`.
-- **Question Paper Upload:** Upload PDF question papers (rendered cleanly via Mozilla PDF.js without browser print/download popups).
-- **Exam Configuration:** Set Exam Title, Course Code, Custom Exam Code, Duration (mins), and **Total Number of Questions** (e.g. 10, 25, 50).
-- **Exam Lifecycle Control:** "Start Exam" (opens exam for students & initiates countdown) and "Conclude Exam".
-- **Real-Time Student Proctoring Monitor:**
-  - Live indicator: Whether the student is **Currently In Fullscreen** or **OUT of Fullscreen**.
-  - **Live Outside Fullscreen Stopwatch:** Tracks and displays exact seconds the student has spent outside fullscreen.
-  - **Total Cumulative Away Time:** Permanent audit of duration away formatted as `MM:SS`.
-  - **Live Answering Progress:** Real-time counter of answered questions (e.g. `8 / 10 Answered`).
-  - **Candidate Answer Review:** Click "Answers" to view student's typed responses for each question (numeric, formulas, text).
-  - **CSV Export:** 1-click download of all student responses and proctoring stats in Excel-ready CSV format.
-  - **Real-Time Security Violation Feed:** Instant alerts for:
-    - Exiting Fullscreen Mode
-    - Tab Switching / Window Minimize (`visibilitychange`)
-    - Window Focus Loss / Multi-monitor / App switching (`window.blur`)
-    - Attempted Copy / Cut / Paste / Right-Click
-    - Attempted Screenshot (`PrintScreen`, Snipping Tool `Win+Shift+S`)
-  - **Examiner Actions:** Full audit log inspection and "Force Submit" option for cheating violations.
+```sh
+npm ci
+npm start
+```
 
-### 🎓 Student Interface (`/student.html`)
-- **Simple Join Portal:** Enter Name, Roll No / ID, and Exam Code.
-- **Waiting Room:** Automatically pauses until the examiner officially starts the test.
-- **Proctoring Agreement:** Explains mandatory fullscreen and anti-cheat policies.
-- **Side-by-Side Exam Environment:**
-  - **Left Pane (PDF Question Paper):** Mozilla PDF.js canvas viewer with page navigation and zoom.
-  - **Top Sticky Bar:** High-visibility countdown timer + answered counter + submit button.
-  - **Right Pane (Candidate Answer Sheet):**
-    - Dynamically generates response boxes for Question 1 through Question N.
-    - Quick-jump navigation chips (`[Q1]`, `[Q2]`...) with visual answered badges.
-    - Allows typing any type of answer: **numbers, text, formulas, or alphabets**.
-    - Auto-saves drafts as you type.
-- **Instant Fullscreen Exit Trap:**
-  - If <kbd>Esc</kbd> or exit is pressed: PDF is immediately obscured behind a high-alert modal.
-  - A live timer begins ticking: *"Duration Outside Fullscreen: 00:08"*.
-  - Teacher is notified in 0 milliseconds via WebSockets.
-  - Button to re-enter fullscreen and resume.
-- **Answer Submission:** On submission or countdown expiry, all typed answers are transmitted to the teacher in real-time.
+Open `http://localhost:3000`, `/teacher.html` or `/student.html`. Set environment variables in your shell or hosting provider; `.env.example` documents the values (the server does not automatically load `.env`). The local development password defaults to `teacher123`. Set `TEACHER_PASSWORD` and `SESSION_SECRET` in Render before using the service for real assessments. Teacher sessions expire after one day and require signing in again after a server restart.
 
----
+## Assessment flow
 
-## 🚀 Running Locally
+1. Sign in as examiner. Upload a PDF (up to 50 MB), set a title, subject, join code, duration of 1–3000 minutes and 1–200 questions.
+2. Candidates enter their name, roll number and case-insensitive code. They wait until the examiner starts the assessment, then enter fullscreen through a user gesture.
+3. The workspace renders every PDF page with zoom/reset controls and a collapsible answer sheet. Drafts save immediately on the candidate's device and sync to the server after 300 ms. Sync labels distinguish device storage from server acknowledgement.
+4. The console shows connected candidates, fullscreen state, live time away, answer counts, flags, answer sheets and audit logs. Answer review reads the synchronized in-memory roster. The examiner may force submission or conclude the exam.
+5. The server finalizes saved answers when the deadline passes, including disconnected candidates. Submission success appears only after server acknowledgement. A new assessment uses a new session identifier so previous drafts and candidates do not carry over.
 
-1. **Install dependencies:**
-   ```bash
-   cd proctor-exam-platform
-   npm install
-   ```
+Candidates resume using the same browser and normalized roll number. A per-session resume token prevents another browser from claiming an existing candidate's record. Keep browser storage available; reconnect from the original browser. An examiner can clear the roster after archiving, but clearing does not erase candidate registration or submission history for the same assessment.
 
-2. **Start the server:**
-   ```bash
-   npm start
-   ```
+## Integrity monitoring
 
-3. **Open in browser:**
-   - **Main Portal:** [http://localhost:3000](http://localhost:3000)
-   - **Teacher Console:** [http://localhost:3000/teacher.html](http://localhost:3000/teacher.html) *(Default password: `teacher123`)*
-   - **Student Portal:** [http://localhost:3000/student.html](http://localhost:3000/student.html)
+During an assessment, observable fullscreen exits, focus loss, tab changes, clipboard actions, right-click, printing, developer-tools shortcuts and screenshot shortcuts can be logged. An overlay covers the workspace after fullscreen exits. PDF access requires an active candidate token or an authenticated teacher.
 
----
+Browser controls are best-effort signals. A webpage cannot reliably prevent operating-system screenshots, recording, external cameras, modified clients or all developer tools. Flags are evidence for examiner review, not proof of misconduct. Browsers without fullscreen support cannot launch the workspace.
 
-## ☁️ Deploying on Render (Free Tier)
+## History, recovery and backups
 
-1. **Push this folder to a GitHub repository.**
-2. Go to [Render.com Dashboard](https://dashboard.render.com/) and click **New +** > **Web Service**.
-3. Connect your GitHub repository.
-4. Set the following build and start settings:
-   - **Environment:** `Node`
-   - **Build Command:** `npm install`
-   - **Start Command:** `node server.js`
-5. Under **Environment Variables**, add:
-   - `TEACHER_PASSWORD`: `YourSecurePasswordHere` (e.g. `MyExamSecret2026`)
-   - `SESSION_SECRET`: `AnyRandomString`
-6. Click **Create Web Service**. Render will build and deploy your app in ~1 minute!
+The server atomically writes a master history, redundant backup, individual session files and an active recovery snapshot. Candidates are merged by normalized roll number; archived nonblank answers and violation logs survive roster clearing and backup imports. Submission and force-submission archive immediately. Recovery reads all replicas and restores active candidates as disconnected until they rejoin.
 
-*(Alternatively, you can use Render's Blueprint feature with the included `render.yaml` file).*
+The authenticated teacher console mirrors history in `localStorage` under `PROCTOR_PERMANENT_EXAM_HISTORY`. If the server history is empty, it can restore the browser mirror. The first empty socket update does not overwrite that mirror. Download JSON backups, restore them through the console, and export active or archived answer sheets as CSV.
+
+**Render free-tier storage is ephemeral.** Server files and question-paper uploads can disappear on redeploy. The browser mirror depends on that browser still retaining data and having received the latest history. It does not back up uploaded PDFs or guarantee zero data loss. Use downloaded backups and persistent storage for important assessments.
+
+Optional storage variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PORT` | `3000` | HTTP port, supplied automatically by Render |
+| `TEACHER_PASSWORD` | `teacher123` | Examiner password |
+| `SESSION_SECRET` | Random per process | Session-cookie signing secret; set a stable random value in production |
+| `DATA_DIR` | `./data` | History and active snapshots |
+| `UPLOADS_DIR` | `./uploads` | Uploaded question papers |
+| `NODE_ENV` | Unset | Use `production` behind Render HTTPS for secure cookies |
+
+For a separately configured Render persistent disk, point `DATA_DIR` and `UPLOADS_DIR` at subdirectories of its mount path. This project does not provision a paid disk automatically. File storage and session state support one service instance; do not scale replicas without a shared database/session store. Tailwind, Font Awesome and PDF.js currently load from CDNs, so client internet access is required.
+
+## Deploy through the existing GitHub repository
+
+The repository is `MonishVinay/exam_gen`. Push to its connected branch (`main`) to trigger the existing Render auto-deploy. The included `render.yaml` specifies `npm ci --omit=dev`, `node server.js`, Node 22 and `/api/health`. Existing dashboard-managed services may require those settings to be applied in Render separately; changing a YAML file alone does not reconfigure a service that is not Blueprint-managed.
+
+The app listens on Render's `PORT` and `0.0.0.0`, uses proxy-aware secure cookies in production, and shuts down with a final snapshot. `/api/health` returns `{ "status": "ok", "app": "ProctorLock" }`.
+
+## Checks
+
+```sh
+npm run check
+npm test
+npm audit
+```
+
+Tests cover REST/WebSocket authentication and logout, PDF/limit validation, waiting candidates, token-protected PDFs, reconnect and restart recovery, immutable submissions, archival before reset, repeated exam isolation, expiry recovery, backup merging, large backups, safe CSV export, corruption recovery and deletion. Client tests run in jsdom entirely in the terminal, with no desktop or browser input; they cover draft isolation, escaped answers/roster text, acknowledgement-based submission, sensor registration, browser-backup recovery and synchronous answer review.

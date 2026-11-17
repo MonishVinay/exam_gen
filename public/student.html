@@ -183,9 +183,9 @@
         <div class="p-3.5 rounded-xl bg-slate-800/80 border border-slate-700/80 flex items-start space-x-3">
           <i class="fa-solid fa-camera-slash text-purple-400 text-sm mt-0.5"></i>
           <div>
-            <strong class="text-white block font-semibold mb-0.5">Screenshot & Screen Recording Blocked</strong>
+            <strong class="text-white block font-semibold mb-0.5">Screenshot Shortcut Monitoring</strong>
             <span class="text-slate-400 leading-relaxed">
-              PrintScreen and screenshot shortcuts are intercepted, will corrupt the capture, and notify the teacher.
+              Observable screenshot shortcuts are flagged. Browsers cannot reliably block operating-system screenshots, recording, or external cameras.
             </span>
           </div>
         </div>
@@ -249,7 +249,7 @@
           <button id="zoom-out-btn" class="w-7 h-7 flex items-center justify-center text-slate-300 hover:text-white hover:bg-slate-700 rounded transition-colors" title="Zoom Out PDF">
             <i class="fa-solid fa-minus text-xs"></i>
           </button>
-          <span id="zoom-level-text" class="px-1.5 font-mono text-[11px] text-slate-400">100%</span>
+          <button id="zoom-reset-btn" title="Reset PDF zoom" class="px-1.5 text-slate-400 hover:text-white"><span id="zoom-level-text" class="font-mono text-[11px]">100%</span></button>
           <button id="zoom-in-btn" class="w-7 h-7 flex items-center justify-center text-slate-300 hover:text-white hover:bg-slate-700 rounded transition-colors" title="Zoom In PDF">
             <i class="fa-solid fa-plus text-xs"></i>
           </button>
@@ -266,6 +266,7 @@
 
     </header>
 
+    <div id="connection-status" role="status" aria-live="polite" class="px-4 py-1 text-xs text-amber-300 bg-slate-900">Connected · drafts sync automatically</div>
     <!-- Main Workspace: Split Screen (Left: PDF Viewer | Right: Candidate Answer Sheet) -->
     <div class="flex-1 flex flex-col md:flex-row overflow-hidden relative" id="workspace-container">
 
@@ -364,7 +365,7 @@
         <div class="font-mono font-black text-4xl text-rose-400 mt-1" id="away-timer-counter">
           00:00
         </div>
-        <p class="text-[11px] text-slate-400 mt-1">This time is being permanently logged to your proctoring audit.</p>
+        <p class="text-[11px] text-slate-400 mt-1">This time is recorded in your proctoring audit.</p>
       </div>
 
       <button 

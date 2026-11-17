@@ -4,3 +4,8 @@ uploads/*
 !uploads/sample-exam.pdf
 .env
 .DS_Store
+data/*.json
+data/sessions/
+tmp/
+test-results/
+*.tmp

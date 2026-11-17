@@ -3,11 +3,15 @@ services:
     name: proctor-exam-platform
     env: node
     plan: free
-    buildCommand: npm install
+    buildCommand: npm ci --omit=dev
     startCommand: node server.js
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
     envVars:
       - key: NODE_VERSION
-        value: 20.0.0
+        value: "22"
+      - key: NODE_ENV
+        value: production
       - key: TEACHER_PASSWORD
         sync: false
       - key: SESSION_SECRET

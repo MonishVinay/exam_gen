@@ -18,6 +18,22 @@ let awayTimerInterval = null;
 let totalCumulativeAwaySeconds = 0;
 let violationsCount = 0;
 let isExamActive = false;
+let sensorsInstalled = false;
+let submissionPending = false;
+let serverClockOffset = 0;
+let renderVersion = 0;
+const draftKey = () => `PROCTOR_DRAFT_${currentExamState?.sessionId}_${currentStudent?.rollNo?.trim().toLowerCase()}`;
+const sessionKey = (id, roll) => `PROCTOR_RESUME_${id}_${roll.trim().toLowerCase()}`;
+function readLocal(key, fallback = null) {
+  try { return JSON.parse(localStorage.getItem(key)) || fallback; } catch { return fallback; }
+}
+function saveDraft() {
+  try { localStorage.setItem(draftKey(), JSON.stringify(studentAnswers)); } catch {}
+}
+function connectionStatus(message) {
+  const el = document.getElementById('connection-status');
+  if (el) el.textContent = message;
+}
 
 // Student Answers State
 let studentAnswers = {};
@@ -114,8 +130,17 @@ function initStudentSocket(name, rollNo, examCode) {
   socket = io();
 
   socket.on('connect', () => {
-    socket.emit('student:join', { name, rollNo, examCode });
+    connectionStatus('Connecting to assessment…');
+    fetch('/api/exam/state').then(r => r.json()).then(({ examState }) => {
+      socket.emit('student:join', { name, rollNo, examCode: currentExamState?.sessionId === examState.sessionId ? currentExamState.examCode : examCode, resumeToken: readLocal(sessionKey(examState.sessionId, rollNo), currentExamState?.sessionId === examState.sessionId ? currentStudent?.resumeToken : null) });
+    }).catch(() => connectionStatus('Unable to reconnect. Your answers remain saved on this device.'));
   });
+  socket.on('disconnect', () => connectionStatus('Offline — answers saved on this device. Reconnecting…'));
+  socket.on('connect_error', () => {
+    connectionStatus('Connection interrupted. Retrying…');
+    joinBtn.disabled = false;
+  });
+  socket.on('operation:error', data => connectionStatus(data.message));
 
   socket.on('student:join_error', (data) => {
     joinBtn.disabled = false;
@@ -128,6 +153,27 @@ function initStudentSocket(name, rollNo, examCode) {
   socket.on('student:joined_success', (data) => {
     currentStudent = data.student;
     currentExamState = data.examState;
+    serverClockOffset = data.serverTime - Date.now();
+    try { localStorage.setItem(sessionKey(currentExamState.sessionId, rollNo), JSON.stringify(currentStudent.resumeToken)); } catch {}
+    totalCumulativeAwaySeconds = currentStudent.outDurationSeconds || 0;
+    violationsCount = (currentStudent.violations || []).length;
+    studentAnswers = { ...(currentStudent.answers || {}), ...readLocal(draftKey(), {}), ...studentAnswers };
+    connectionStatus('Connected · drafts sync automatically');
+    if (currentStudent.status === 'submitted') {
+      studentAnswers = currentStudent.answers || {};
+      showSubmissionConfirmation();
+      return;
+    }
+    if (submissionPending) {
+      submissionPending = false;
+      finalizeExamSubmission();
+      return;
+    }
+    if (isExamActive) {
+      for (const [q, answer] of Object.entries(studentAnswers)) sendAnswer(q, answer);
+      socket.emit(document.fullscreenElement || document.webkitFullscreenElement ? 'student:fullscreen_entered' : 'student:fullscreen_exited');
+      return;
+    }
 
     // Check exam status
     if (currentExamState.status === 'active') {
@@ -144,16 +190,20 @@ function initStudentSocket(name, rollNo, examCode) {
   });
 
   socket.on('exam:ended', () => {
-    if (isExamActive) {
-      alert('The exam has been concluded by the examiner.');
-      finalizeExamSubmission();
-    }
+    if (!currentStudent) return;
+    // The server finalizes acknowledged drafts even when a candidate is disconnected.
+    socket.emit('student:submit_exam', { answers: studentAnswers }, result => {
+      if (result?.student) currentStudent = result.student;
+      showSubmissionConfirmation();
+    });
   });
 
   socket.on('student:force_submitted', (data) => {
     alert(`Your exam was submitted by the examiner.\nReason: ${data.reason}`);
-    finalizeExamSubmission();
+    if (data.student) currentStudent = data.student;
+    showSubmissionConfirmation();
   });
+  socket.on('exam:updated', state => { if (currentStudent && !isExamActive) currentExamState = state; });
 }
 
 function showWaitingScreen() {
@@ -184,6 +234,8 @@ enterFullscreenBtn.addEventListener('click', async () => {
       await document.documentElement.requestFullscreen();
     } else if (document.documentElement.webkitRequestFullscreen) {
       await document.documentElement.webkitRequestFullscreen();
+    } else {
+      throw new Error('This browser does not support fullscreen. Use a desktop browser.');
     }
 
     launchExamSession();
@@ -208,10 +260,11 @@ function launchExamSession() {
   startExamTimer(currentExamState.endTime);
 
   // Load and render PDF
-  loadExamPDF(currentExamState.pdfUrl);
+  loadExamPDF(`${currentExamState.pdfUrl}?token=${encodeURIComponent(currentStudent.resumeToken)}`);
 
   // Build Candidate Answer Response Sheet
   buildAnswerInterface(currentExamState.totalQuestions || 10);
+  for (const [q, answer] of Object.entries(studentAnswers)) sendAnswer(q, answer);
 
   // Setup security traps
   setupProctoringSensors();
@@ -237,16 +290,19 @@ async function loadExamPDF(url) {
     renderAllPDFPages();
   } catch (err) {
     console.error('Error loading PDF:', err);
-    pdfLoadingSpinner.innerHTML = `<span class="text-rose-400">Failed to render question paper: ${err.message}</span>`;
+    pdfLoadingSpinner.textContent = `Failed to render question paper: ${err.message}. Check your connection and reload to resume.`;
+    pdfLoadingSpinner.classList.remove('hidden');
   }
 }
 
 async function renderAllPDFPages() {
   if (!pdfDoc) return;
+  const version = ++renderVersion;
   pdfPagesWrapper.innerHTML = '';
 
   for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
     const page = await pdfDoc.getPage(pageNum);
+    if (version !== renderVersion) return;
     const viewport = page.getViewport({ scale: currentZoom });
 
     const canvas = document.createElement('canvas');
@@ -267,7 +323,7 @@ async function renderAllPDFPages() {
 // Zoom Controls
 zoomInBtn.addEventListener('click', () => {
   if (currentZoom < 2.5) {
-    currentZoom += 0.2;
+    currentZoom += 0.18;
     zoomLevelText.textContent = `${Math.round(currentZoom * 100 / 1.2)}%`;
     renderAllPDFPages();
   }
@@ -275,7 +331,7 @@ zoomInBtn.addEventListener('click', () => {
 
 zoomOutBtn.addEventListener('click', () => {
   if (currentZoom > 0.6) {
-    currentZoom -= 0.2;
+    currentZoom -= 0.18;
     zoomLevelText.textContent = `${Math.round(currentZoom * 100 / 1.2)}%`;
     renderAllPDFPages();
   }
@@ -290,7 +346,7 @@ function buildAnswerInterface(totalQuestions) {
   }
 
   // Load any previously saved draft from localStorage or server payload
-  const localDraftKey = `PROCTOR_DRAFT_${currentExamState?.examCode || 'EXAM'}_${currentStudent?.rollNo || 'ANON'}`;
+  const localDraftKey = draftKey();
   let localDraft = {};
   try {
     const raw = localStorage.getItem(localDraftKey);
@@ -298,8 +354,8 @@ function buildAnswerInterface(totalQuestions) {
   } catch (e) {}
 
   studentAnswers = {
-    ...localDraft,
     ...(currentStudent?.answers || {}),
+    ...localDraft,
     ...studentAnswers
   };
 
@@ -344,13 +400,15 @@ function buildAnswerInterface(totalQuestions) {
         rows="3"
         placeholder="Type answer for Question ${i} (numeric or text)..."
         class="w-full p-2.5 rounded-lg bg-slate-950 border border-slate-800 text-slate-100 placeholder-slate-600 font-mono text-xs focus:outline-none focus:border-indigo-500 transition-all resize-y select-text"
-      >${existingVal}</textarea>
+      ></textarea>
     `;
 
     if (answersInputsContainer) answersInputsContainer.appendChild(card);
 
     // Wire up textarea input
     const textarea = card.querySelector(`#answer-q-${i}`);
+    textarea.value = existingVal;
+    textarea.maxLength = 50000;
     textarea.addEventListener('input', (e) => {
       handleAnswerInput(i, e.target.value);
     });
@@ -365,7 +423,7 @@ function handleAnswerInput(qNum, value) {
 
   // Save to student local storage immediately
   try {
-    const localDraftKey = `PROCTOR_DRAFT_${currentExamState?.examCode || 'EXAM'}_${currentStudent?.rollNo || 'ANON'}`;
+    const localDraftKey = draftKey();
     localStorage.setItem(localDraftKey, JSON.stringify(studentAnswers));
   } catch (e) {}
 
@@ -383,7 +441,7 @@ function handleAnswerInput(qNum, value) {
   const statusEl = document.getElementById(`save-status-${qNum}`);
   if (statusEl) {
     if (isAnswered) {
-      statusEl.innerHTML = '<span class="text-emerald-400 font-semibold flex items-center space-x-1"><i class="fa-solid fa-check text-[9px]"></i><span>Saved</span></span>';
+      statusEl.textContent = 'Saved on device';
     } else {
       statusEl.className = 'text-[10px] font-medium text-slate-500';
       statusEl.textContent = 'Pending';
@@ -396,13 +454,17 @@ function handleAnswerInput(qNum, value) {
   // Auto-save draft over WebSockets (debounced 300ms)
   clearTimeout(saveAnswerDebounceTimers[qNum]);
   saveAnswerDebounceTimers[qNum] = setTimeout(() => {
-    if (socket) {
-      socket.emit('student:save_answer', {
-        questionNumber: qNum,
-        answer: value
-      });
-    }
+    sendAnswer(qNum, value);
   }, 300);
+}
+
+function sendAnswer(questionNumber, answer) {
+  const status = document.getElementById(`save-status-${questionNumber}`);
+  if (!socket?.connected) { if (status) status.textContent = 'Saved on device'; return; }
+  if (status) status.textContent = 'Syncing…';
+  socket.timeout(6000).emit('student:save_answer', { questionNumber, answer }, (error, result) => {
+    if (status) status.textContent = !error && result?.success ? 'Saved to server' : 'Saved on device';
+  });
 }
 
 function updateAnswerProgress(totalQuestions) {
@@ -476,7 +538,7 @@ function startExamTimer(endTime) {
   clearInterval(examCountdownInterval);
 
   function tick() {
-    const remainingMs = endTime - Date.now();
+    const remainingMs = endTime - (Date.now() + serverClockOffset);
     if (remainingMs <= 0) {
       examCountdownDisplay.textContent = '00:00:00';
       clearInterval(examCountdownInterval);
@@ -501,6 +563,11 @@ function startExamTimer(endTime) {
 // 5. PROCTORING & SECURITY SENSORS (HACKERRANK-GRADE)
 // ----------------------------------------------------
 function setupProctoringSensors() {
+  if (sensorsInstalled) return;
+  sensorsInstalled = true;
+  document.addEventListener('selectstart', e => {
+    if (isExamActive && !e.target.closest('textarea, input')) e.preventDefault();
+  });
   // A. Fullscreen Exit Detection
   document.addEventListener('fullscreenchange', handleFullscreenStateChange);
   document.addEventListener('webkitfullscreenchange', handleFullscreenStateChange);
@@ -551,7 +618,7 @@ function setupProctoringSensors() {
     if (!isExamActive) return;
     if (e.key === 'PrintScreen') {
       shieldScreen();
-      flagViolation('screenshot_attempt', 'Pressed PrintScreen key (screenshot blocked)');
+      flagViolation('screenshot_attempt', 'PrintScreen shortcut observed');
     }
   });
 
@@ -560,8 +627,9 @@ function setupProctoringSensors() {
 
     // Detect PrintScreen
     if (e.key === 'PrintScreen') {
+      e.preventDefault();
       shieldScreen();
-      flagViolation('screenshot_attempt', 'Pressed PrintScreen key (screenshot blocked)');
+      flagViolation('screenshot_attempt', 'PrintScreen shortcut observed');
     }
 
     // Detect Ctrl+P / Cmd+P (Print)
@@ -571,9 +639,14 @@ function setupProctoringSensors() {
     }
 
     // Detect Snipping Tool (Win+Shift+S / Cmd+Shift+3 or 4)
-    if (e.shiftKey && (e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
+    if (e.metaKey && e.shiftKey && ['s', '3', '4', '#', '$'].includes(e.key.toLowerCase())) {
+      e.preventDefault();
       shieldScreen();
       flagViolation('screenshot_attempt', 'Attempted snipping tool shortcut');
+    }
+    if (e.key === 'F12' || ((e.ctrlKey || e.metaKey) && ((e.shiftKey && ['i', 'j', 'c'].includes(e.key.toLowerCase())) || e.key.toLowerCase() === 'u'))) {
+      e.preventDefault();
+      flagViolation('devtools_attempt', 'Developer tools or source shortcut observed');
     }
   });
 }
@@ -594,6 +667,7 @@ function handleFullscreenStateChange() {
 }
 
 function onFullscreenExited() {
+  if (outOfFullscreenStartTime) return;
   outOfFullscreenStartTime = Date.now();
   fullscreenAlertOverlay.classList.remove('hidden');
 
@@ -639,6 +713,7 @@ resumeFullscreenBtn.addEventListener('click', async () => {
 
 // Flash Screen Shield (Blanks out screen briefly on screenshot attempt)
 function shieldScreen() {
+  navigator.clipboard?.writeText('').catch(() => {});
   screenshotShield.style.display = 'block';
   setTimeout(() => {
     screenshotShield.style.display = 'none';
@@ -647,6 +722,8 @@ function shieldScreen() {
 
 // Flag Violation Helper
 function flagViolation(type, details) {
+  if (flagViolation.last?.type === type && Date.now() - flagViolation.last.time < 1000) return;
+  flagViolation.last = { type, time: Date.now() };
   violationsCount++;
   if (socket) {
     socket.emit('student:violation', { type, details });
@@ -663,14 +740,38 @@ studentSubmitBtn.addEventListener('click', () => {
 });
 
 function finalizeExamSubmission() {
+  if (submissionPending) return;
+  saveDraft();
+  Object.values(saveAnswerDebounceTimers).forEach(clearTimeout);
+  submissionPending = true;
+  studentSubmitBtn.disabled = true;
+  connectionStatus('Submitting assessment…');
+  if (!socket?.connected) {
+    connectionStatus('Submission pending — reconnect to send your saved answers. Keep this page open.');
+    return;
+  }
+  socket.timeout(8000).emit('student:submit_exam', { answers: studentAnswers }, (error, result) => {
+    submissionPending = false;
+    studentSubmitBtn.disabled = false;
+    if (error || !result?.success) {
+      connectionStatus('Submission not confirmed. Your answers are saved on this device. Retry Submit Exam.');
+      return;
+    }
+    currentStudent = result.student;
+    showSubmissionConfirmation();
+  });
+}
+
+function showSubmissionConfirmation() {
   isExamActive = false;
+  submissionPending = false;
   clearInterval(examCountdownInterval);
   clearInterval(awayTimerInterval);
 
-  // Send answers payload to examiner
-  if (socket) {
-    socket.emit('student:submit_exam', { answers: studentAnswers });
-  }
+  Object.values(saveAnswerDebounceTimers).forEach(clearTimeout);
+  studentAnswers = currentStudent?.answers || studentAnswers;
+  totalCumulativeAwaySeconds = currentStudent?.outDurationSeconds || 0;
+  violationsCount = (currentStudent?.violations || []).length;
 
   // Exit fullscreen cleanly
   if (document.fullscreenElement) {
@@ -681,6 +782,9 @@ function finalizeExamSubmission() {
 
   // Show confirmation screen
   examViewport.classList.add('hidden');
+  joinScreen.classList.add('hidden');
+  waitingScreen.classList.add('hidden');
+  permissionScreen.classList.add('hidden');
   fullscreenAlertOverlay.classList.add('hidden');
   submittedScreen.classList.remove('hidden');
 
@@ -693,3 +797,9 @@ function finalizeExamSubmission() {
   finalAwayDuration.textContent = formatDuration(totalCumulativeAwaySeconds);
   finalViolationsCount.textContent = violationsCount;
 }
+
+document.getElementById('zoom-reset-btn')?.addEventListener('click', () => {
+  currentZoom = 1.2;
+  zoomLevelText.textContent = '100%';
+  renderAllPDFPages();
+});
