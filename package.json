@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "test": "node --test",
-    "check": "node --check server.js && node --check lib/storage.js && node --check public/js/student.js && node --check public/js/teacher.js"
+    "check": "node --check server.js && node --check lib/storage.js && node --check lib/schedule-store.js && node --check public/js/student.js && node --check public/js/teacher.js"
   },
   "keywords": [],
   "author": "",

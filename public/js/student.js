@@ -184,6 +184,7 @@ function initStudentSocket(name, rollNo, examCode) {
   });
 
   socket.on('exam:started', (state) => {
+    if (!currentStudent) return;
     currentExamState = state;
     if (isExamActive) return;
     showPermissionScreen();
@@ -203,7 +204,9 @@ function initStudentSocket(name, rollNo, examCode) {
     if (data.student) currentStudent = data.student;
     showSubmissionConfirmation();
   });
-  socket.on('exam:updated', state => { if (currentStudent && !isExamActive) currentExamState = state; });
+  socket.on('exam:updated', state => {
+    if (currentStudent && !isExamActive) { currentExamState = state; showWaitingScreen(); }
+  });
 }
 
 function showWaitingScreen() {
@@ -215,6 +218,12 @@ function showWaitingScreen() {
   waitingExamTitle.textContent = currentExamState.title || 'the assessment';
   waitingStudentName.textContent = currentStudent.name;
   waitingStudentRoll.textContent = currentStudent.rollNo;
+  const heading = document.getElementById('waiting-heading');
+  const details = document.getElementById('waiting-start-details');
+  if (heading) heading.textContent = currentExamState.status === 'scheduled' ? 'Waiting for Scheduled Start' : 'Waiting for Examiner to Start';
+  if (details) details.textContent = currentExamState.status === 'scheduled'
+    ? `Starts ${new Date(currentExamState.scheduledStartTime).toLocaleString()}. Ends ${new Date(currentExamState.scheduledStartTime + currentExamState.durationMinutes * 60000).toLocaleString()}. You will be prompted to enter fullscreen when it begins.`
+    : 'Please stay on this screen. As soon as the examiner starts the test, you will be prompted to enter fullscreen and begin.';
 }
 
 function showPermissionScreen() {

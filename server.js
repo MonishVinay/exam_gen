@@ -7,14 +7,23 @@ const { Server } = require('socket.io');
 const session = require('express-session');
 const multer = require('multer');
 const { createStorage, mergeHistory, rollKey, answeredCount, safeId } = require('./lib/storage');
+const { createGitHubScheduleStore } = require('./lib/schedule-store');
 
 function createApp(options = {}) {
+  const clock = options.now || Date.now;
   const app = express(), server = http.createServer(app);
   const io = new Server(server, { maxHttpBufferSize: 2 * 1024 * 1024 });
   const dataDir = options.dataDir || process.env.DATA_DIR || path.join(__dirname, 'data');
   const uploadsDir = options.uploadsDir || process.env.UPLOADS_DIR || path.join(__dirname, 'uploads');
   fs.mkdirSync(uploadsDir, { recursive: true });
   const storage = createStorage(dataDir);
+  const scheduleStore = options.scheduleStore || (process.env.EXAM_STORAGE_TOKEN ? createGitHubScheduleStore({
+    token: process.env.EXAM_STORAGE_TOKEN, repo: process.env.EXAM_STORAGE_REPO || process.env.RENDER_GIT_REPO_SLUG,
+    secret: process.env.EXAM_STORAGE_KEY || process.env.SESSION_SECRET,
+    branch: process.env.EXAM_STORAGE_BRANCH || 'proctorlock-exams'
+  }) : null);
+  const requireDurableSchedules = options.requireDurableSchedules ?? process.env.RENDER === 'true';
+  let initialized = false, savingExam = false;
   const password = options.password || process.env.TEACHER_PASSWORD || 'teacher123';
   const sessionMiddleware = session({
     secret: process.env.SESSION_SECRET || randomBytes(32).toString('hex'),
@@ -41,7 +50,8 @@ function createApp(options = {}) {
   app.use(express.static(path.join(__dirname, 'public')));
   let examState = {
     sessionId: null, status: 'idle', title: 'General Assessment', subject: '', durationMinutes: 60,
-    totalQuestions: 10, pdfUrl: null, pdfFileName: null, startTime: null, endTime: null, examCode: 'EXAM101'
+    totalQuestions: 10, pdfUrl: null, pdfFileName: null, startTime: null, endTime: null,
+    scheduledStartTime: null, examCode: 'EXAM101'
   };
   // Candidate identity remains stable across socket reconnections.
   let students = new Map();
@@ -53,17 +63,17 @@ function createApp(options = {}) {
       s.connected = false; s.inFullscreen = false;
       if (s.status !== 'submitted') {
         s.status = 'disconnected';
-        if (examState.status === 'active') s.outOfFullscreenSince ||= recovered.updatedAt || Date.now();
+        if (examState.status === 'active') s.outOfFullscreenSince ||= recovered.updatedAt || clock();
       }
       students.set(rollKey(s.rollNo), s);
     }
   }
-  const nowISO = () => new Date().toISOString();
+  const nowISO = () => new Date(clock()).toISOString();
   function snapshot(s) {
-    return { ...s, liveAwaySeconds: s.outOfFullscreenSince && s.status !== 'submitted' ? Math.max(0, Math.round((Date.now() - s.outOfFullscreenSince) / 1000)) : 0 };
+    return { ...s, liveAwaySeconds: s.outOfFullscreenSince && s.status !== 'submitted' ? Math.max(0, Math.round((clock() - s.outOfFullscreenSince) / 1000)) : 0 };
   }
   const roster = () => [...students.values()].map(snapshot);
-  function persist() { storage.saveActive({ examState, students: Object.fromEntries(students), updatedAt: Date.now() }); }
+  function persist() { storage.saveActive({ examState, students: Object.fromEntries(students), updatedAt: clock() }); }
   function archive(reason) {
     if (!examState.sessionId) return null;
     const old = storage.history().find(e => e.id === examState.sessionId);
@@ -83,7 +93,7 @@ function createApp(options = {}) {
     io.to('teachers_room').emit('teacher:new_notification', { type, title, message, timestamp: new Date().toLocaleTimeString() });
   }
   function settleAway(s) {
-    if (s.outOfFullscreenSince) s.outDurationSeconds += Math.max(0, Math.round((Date.now() - s.outOfFullscreenSince) / 1000));
+    if (s.outOfFullscreenSince) s.outDurationSeconds += Math.max(0, Math.round((clock() - s.outOfFullscreenSince) / 1000));
     s.outOfFullscreenSince = null; s.liveAwaySeconds = 0;
   }
   function finishStudent(s) {
@@ -98,7 +108,64 @@ function createApp(options = {}) {
     io.to('teachers_room').emit('exam:ended', { message: reason });
     return entry;
   }
-  if (examState.status === 'active' && examState.endTime <= Date.now()) conclude('Assessment time completed during restart');
+  function paperExists() {
+    return !!examState.pdfUrl && fs.existsSync(path.join(uploadsDir, path.basename(examState.pdfUrl)));
+  }
+  function activateExam(startTime) {
+    examState.status = 'active'; examState.startTime = startTime;
+    examState.endTime = startTime + examState.durationMinutes * 60000;
+    for (const s of students.values()) if (s.status !== 'submitted') {
+      s.status = s.connected ? 'in_test' : 'disconnected';
+      // A sleeping server must not charge candidates for time before it resumed.
+      s.outOfFullscreenSince ||= clock();
+    }
+    if (examState.endTime <= clock()) {
+      conclude('The scheduled assessment window has ended.');
+      return;
+    }
+    persist(); archive('Assessment commenced'); broadcast();
+    io.emit('exam:started', { ...examState, serverTime: clock() });
+  }
+  function reconcileExamTiming() {
+    if (!savingExam && examState.status === 'scheduled' && examState.scheduledStartTime <= clock()) {
+      if (paperExists()) activateExam(examState.scheduledStartTime);
+    }
+    if (examState.status === 'active' && examState.endTime <= clock()) conclude('The assessment time has completed.');
+  }
+  // Reconcile persisted timestamps at boot and on requests; correctness never depends on a timer firing while asleep.
+  const ready = (async () => {
+    if (scheduleStore) {
+      const saved = await scheduleStore.load();
+      if (saved) {
+        const sameSession = saved.examState.sessionId === examState.sessionId;
+        examState = { ...examState, ...saved.examState };
+        if (!sameSession) students = new Map();
+        const paperPath = path.join(uploadsDir, path.basename(examState.pdfUrl));
+        fs.writeFileSync(`${paperPath}.tmp`, saved.paper);
+        fs.renameSync(`${paperPath}.tmp`, paperPath);
+        persist();
+      }
+    }
+    reconcileExamTiming();
+    initialized = true;
+  })();
+  ready.catch(() => {});
+  app.use(['/api', '/uploads'], async (req, res, next) => {
+    try { await ready; reconcileExamTiming(); next(); } catch {
+      res.status(503).json({ success: false, error: 'Exam recovery is unavailable. Ask the examiner to check schedule storage settings.' });
+    }
+  });
+  io.use((socket, next) => { ready.then(() => next(), () => next(new Error('Exam recovery unavailable'))); });
+  async function saveRemoteExam(state) {
+    if (scheduleStore) await scheduleStore.save(state, fs.readFileSync(path.join(uploadsDir, path.basename(state.pdfUrl))));
+  }
+  function lockExamSave(req, res, next) {
+    if (savingExam) return res.status(409).json({ success: false, error: 'An assessment change is already being saved. Try again shortly.' });
+    savingExam = true;
+    res.once('finish', () => { savingExam = false; });
+    res.once('close', () => { savingExam = false; });
+    next();
+  }
   function requireTeacher(req, res, next) {
     if (req.session?.isTeacher) return next();
     res.status(401).json({ success: false, error: 'Teacher login required' });
@@ -115,7 +182,7 @@ function createApp(options = {}) {
   app.get('/api/health', (req, res) => res.json({ status: 'ok', app: 'ProctorLock' }));
   const attempts = new Map();
   app.post('/api/teacher/login', (req, res, next) => {
-    const now = Date.now();
+    const now = clock();
     for (const [ip, a] of attempts) if (a.until < now) attempts.delete(ip);
     const attempt = attempts.get(req.ip) || { count: 0, until: now + 600000 };
     if (attempt.count >= 20) return res.status(429).json({ success: false, error: 'Too many attempts. Try again in 10 minutes.' });
@@ -132,6 +199,13 @@ function createApp(options = {}) {
     });
   });
   app.get('/api/teacher/auth-status', (req, res) => res.json({ authenticated: !!req.session?.isTeacher }));
+  app.get('/api/teacher/schedule-storage', requireTeacher, (req, res) => res.json({
+    sleepSafe: !!scheduleStore, provider: scheduleStore?.provider || 'local',
+    message: scheduleStore
+      ? 'The schedule and PDF are saved encrypted outside Render. Students can wake the app without the teacher.'
+      : requireDurableSchedules ? 'To schedule exams through Render sleep, configure EXAM_STORAGE_TOKEN, EXAM_STORAGE_REPO and a stable EXAM_STORAGE_KEY in Render. No database is needed.'
+        : 'Local schedules survive restarts only while these files remain available. Configure GitHub storage before using Render free tier.'
+  }));
   app.post('/api/teacher/logout', (req, res, next) => {
     const sid = req.sessionID;
     for (const socket of io.sockets.sockets.values()) if (socket.request.sessionID === sid) socket.disconnect(true);
@@ -140,7 +214,7 @@ function createApp(options = {}) {
       res.clearCookie('connect.sid'); res.json({ success: true });
     });
   });
-  app.get('/api/exam/state', (req, res) => res.json({ examState, studentsCount: roster().filter(s => s.connected).length, serverTime: Date.now() }));
+  app.get('/api/exam/state', (req, res) => res.json({ examState, studentsCount: roster().filter(s => s.connected).length, serverTime: clock() }));
   app.use('/uploads', (req, res, next) => {
     if (req.session?.isTeacher) return next();
     const token = req.query.token;
@@ -149,11 +223,11 @@ function createApp(options = {}) {
     if (`/uploads${req.path}` !== examState.pdfUrl) return res.status(403).json({ error: 'Paper unavailable' });
     next();
   }, express.static(uploadsDir, { dotfiles: 'deny' }));
-  app.post('/api/teacher/exam', requireTeacher, (req, res, next) => {
+  app.post('/api/teacher/exam', requireTeacher, lockExamSave, (req, res, next) => {
     if (examState.status === 'active') return res.status(409).json({ success: false, error: 'Conclude the active assessment before changing its configuration.' });
     next();
-  }, upload.single('examPdf'), (req, res) => {
-    const { title, subject = '', examCode, durationMinutes, totalQuestions } = req.body;
+  }, upload.single('examPdf'), async (req, res) => {
+    const { title, subject = '', examCode, durationMinutes, totalQuestions, scheduledStartTime } = req.body;
     const duration = Number(durationMinutes), questions = Number(totalQuestions);
     function reject(message) {
       if (req.file) fs.unlinkSync(req.file.path);
@@ -162,46 +236,61 @@ function createApp(options = {}) {
     if (typeof title !== 'string' || !title.trim() || title.length > 200 || typeof subject !== 'string' || subject.length > 200) return reject('Enter a title and subject of up to 200 characters.');
     if (!Number.isInteger(duration) || duration < 1 || duration > 3000 || !Number.isInteger(questions) || questions < 1 || questions > 200) return reject('Duration must be 1–3000 minutes and questions must be 1–200.');
     if (typeof examCode !== 'string' || !/^[a-zA-Z0-9_-]{1,40}$/.test(examCode.trim())) return reject('Use 1–40 letters, numbers, underscores or hyphens for the join code.');
+    const scheduled = scheduledStartTime ? Date.parse(scheduledStartTime) : null;
+    if (scheduledStartTime && (!Number.isFinite(scheduled) || !/[zZ]$|[+-]\d{2}:\d{2}$/.test(scheduledStartTime) || scheduled <= clock())) return reject('Choose a future scheduled start time with a timezone.');
+    if (scheduled && requireDurableSchedules && !scheduleStore) {
+      if (req.file) fs.unlinkSync(req.file.path);
+      return res.status(503).json({ success: false, error: 'Sleep-safe scheduling needs GitHub storage. Configure EXAM_STORAGE_TOKEN, EXAM_STORAGE_REPO and EXAM_STORAGE_KEY in Render. No database is required.' });
+    }
     if (req.file) {
       const fd = fs.openSync(req.file.path, 'r'), header = Buffer.alloc(5);
       try { fs.readSync(fd, header, 0, 5, 0); } finally { fs.closeSync(fd); }
       if (header.toString() !== '%PDF-') return reject('The uploaded file is not a valid PDF.');
     }
-    if (!req.file && !examState.pdfUrl) return reject('Upload a PDF question paper.');
-    archive('Archived before assessment reconfiguration');
-    if (examState.status === 'ended') {
-      io.in('students_room').disconnectSockets(true); students = new Map();
-    }
-    examState = {
-      ...examState, sessionId: examState.status === 'created' ? examState.sessionId : `exam-${randomUUID()}`,
-      status: 'created', title: title.trim(), subject: subject.trim(), durationMinutes: duration,
+    if (!req.file && !paperExists()) return reject('Upload a PDF question paper. The previous file is unavailable.');
+    const nextState = {
+      ...examState, sessionId: ['created', 'scheduled'].includes(examState.status) ? examState.sessionId : `exam-${randomUUID()}`,
+      status: scheduled ? 'scheduled' : 'created', scheduledStartTime: scheduled,
+      title: title.trim(), subject: subject.trim(), durationMinutes: duration,
       totalQuestions: questions, examCode: examCode.trim().toUpperCase(), startTime: null, endTime: null,
       pdfUrl: req.file ? `/uploads/${req.file.filename}` : examState.pdfUrl,
       pdfFileName: req.file ? req.file.originalname : examState.pdfFileName
     };
+    try { await saveRemoteExam(nextState); } catch {
+      if (req.file) fs.unlinkSync(req.file.path);
+      return res.status(503).json({ success: false, error: 'The exam could not be saved to GitHub storage. The previous assessment is unchanged. Check the repository token and retry.' });
+    }
+    archive('Archived before assessment reconfiguration');
+    if (examState.status === 'ended') {
+      io.in('students_room').disconnectSockets(true); students = new Map();
+    }
+    examState = nextState;
     persist(); io.emit('exam:updated', examState); broadcast();
     res.json({ success: true, examState });
   });
-  app.post('/api/teacher/exam/start', requireTeacher, (req, res) => {
+  app.post('/api/teacher/exam/start', requireTeacher, lockExamSave, async (req, res) => {
     if (!examState.pdfUrl || examState.status === 'idle') return res.status(400).json({ success: false, error: 'Upload and save an assessment first.' });
     if (examState.status === 'active') return res.status(409).json({ success: false, error: 'Assessment already active.' });
     if (!fs.existsSync(path.join(uploadsDir, path.basename(examState.pdfUrl)))) return res.status(400).json({ success: false, error: 'The question paper is missing. Upload it again.' });
+    const startTime = clock();
+    const nextState = { ...examState, status: 'active', scheduledStartTime: null, startTime,
+      endTime: startTime + examState.durationMinutes * 60000,
+      sessionId: examState.status === 'ended' ? `exam-${randomUUID()}` : examState.sessionId };
+    try { await saveRemoteExam(nextState); } catch {
+      return res.status(503).json({ success: false, error: 'The start could not be saved to schedule storage. Please retry.' });
+    }
     if (examState.status === 'ended') {
       archive('Archived before restart'); io.in('students_room').disconnectSockets(true); students = new Map();
-      examState.sessionId = `exam-${randomUUID()}`;
     }
-    examState.status = 'active'; examState.startTime = Date.now();
-    examState.endTime = examState.startTime + examState.durationMinutes * 60000;
-    for (const s of students.values()) if (s.status !== 'submitted') {
-      s.status = s.connected ? 'in_test' : 'disconnected';
-      s.outOfFullscreenSince ||= examState.startTime;
-    }
-    persist(); archive('Assessment commenced'); broadcast();
-    io.emit('exam:started', { ...examState, serverTime: Date.now() });
+    examState = nextState;
+    activateExam(startTime);
     res.json({ success: true, examState });
   });
-  app.post('/api/teacher/exam/end', requireTeacher, (req, res) => {
+  app.post('/api/teacher/exam/end', requireTeacher, lockExamSave, async (req, res) => {
     if (examState.status !== 'active') return res.status(409).json({ success: false, error: 'No active assessment.' });
+    try { await saveRemoteExam({ ...examState, status: 'ended' }); } catch {
+      return res.status(503).json({ success: false, error: 'The early conclusion could not be saved to schedule storage. Please retry.' });
+    }
     res.json({ success: true, archived: conclude('The assessment was concluded by the examiner.'), examState });
   });
   app.post('/api/teacher/student/force-submit', requireTeacher, (req, res) => {
@@ -220,7 +309,7 @@ function createApp(options = {}) {
   }
   app.post('/api/teacher/students/clear-inactive', requireTeacher, (req, res) => res.json({ success: true, removedCount: clearRoster(), remainingCount: 0 }));
   app.get('/api/teacher/history', requireTeacher, (req, res) => res.json({ success: true, history: storage.history() }));
-  app.get('/api/teacher/history/backup-json', requireTeacher, (req, res) => res.attachment(`proctorlock-backup-${Date.now()}.json`).json(storage.history()));
+  app.get('/api/teacher/history/backup-json', requireTeacher, (req, res) => res.attachment(`proctorlock-backup-${clock()}.json`).json(storage.history()));
   app.post('/api/teacher/history/restore-backup', requireTeacher, (req, res) => {
     const list = req.body?.history;
     if (!Array.isArray(list) || list.length > 10000 || list.some(e => !e || !safeId(e.id) || !Array.isArray(e.students) || !Number.isInteger(e.totalQuestions) || e.totalQuestions < 1 || e.totalQuestions > 200 || e.students.some(s => !s || typeof s.rollNo !== 'string' || !rollKey(s.rollNo) || !s.answers || typeof s.answers !== 'object' || Array.isArray(s.answers) || Object.values(s.answers).some(a => typeof a !== 'string') || (s.violations !== undefined && !Array.isArray(s.violations))))) return res.status(400).json({ success: false, error: 'Invalid exam history backup' });
@@ -264,6 +353,7 @@ function createApp(options = {}) {
     res.status(error.status || (error instanceof multer.MulterError ? 400 : 500)).json({ success: false, error: error.message });
   });
   io.on('connection', socket => {
+    try { reconcileExamTiming(); } catch { socket.disconnect(true); return; }
     if (socket.handshake.headers.origin) {
       try { if (new URL(socket.handshake.headers.origin).host !== socket.handshake.headers.host) return socket.disconnect(true); }
       catch { return socket.disconnect(true); }
@@ -282,7 +372,8 @@ function createApp(options = {}) {
     socket.on('teacher:clear_inactive', () => authorizedTeacher(clearRoster));
     socket.on('student:join', (data = {}) => {
       try {
-        if (!['created', 'active', 'ended'].includes(examState.status)) return socket.emit('student:join_error', { message: 'No assessment is available yet.' });
+        reconcileExamTiming();
+        if (!['created', 'scheduled', 'active', 'ended'].includes(examState.status)) return socket.emit('student:join_error', { message: 'No assessment is available yet.' });
         if (typeof data.name !== 'string' || !data.name.trim() || data.name.length > 120 || typeof data.rollNo !== 'string' || !data.rollNo.trim() || data.rollNo.length > 80 || typeof data.examCode !== 'string' || data.examCode.trim().toUpperCase() !== examState.examCode) return socket.emit('student:join_error', { message: 'Enter your name, roll number and a valid exam code.' });
         const key = rollKey(data.rollNo);
         if (socket.data.roll && socket.data.roll !== key) return socket.emit('student:join_error', { message: 'Already joined as another candidate.' });
@@ -300,11 +391,11 @@ function createApp(options = {}) {
         s.resumeToken ||= randomBytes(32).toString('hex'); s.socketId = socket.id; s.connected = true; s.inFullscreen = false;
         if (s.status !== 'submitted') {
           s.status = examState.status === 'active' ? 'in_test' : 'waiting';
-          if (examState.status === 'active') s.outOfFullscreenSince ||= Date.now();
+          if (examState.status === 'active') s.outOfFullscreenSince ||= clock();
         }
         students.set(key, s); socket.data.roll = key; socket.data.sessionId = examState.sessionId;
         socket.join('students_room'); persist(); archive('Candidate joined');
-        socket.emit('student:joined_success', { student: snapshot(s), examState, serverTime: Date.now() });
+        socket.emit('student:joined_success', { student: snapshot(s), examState, serverTime: clock() });
         broadcast(); notify('info', 'Candidate joined', `${s.name} (${s.rollNo}) joined the room.`);
       } catch (error) { socket.emit('student:join_error', { message: error.message }); }
     });
@@ -314,7 +405,7 @@ function createApp(options = {}) {
     }
     function editableStudent() {
       const s = currentStudent();
-      if (examState.status === 'active' && Date.now() >= examState.endTime) conclude('The assessment time has completed.');
+      reconcileExamTiming();
       return s && s.status !== 'submitted' && examState.status === 'active' ? s : null;
     }
     function addViolation(s, type, details) {
@@ -335,13 +426,13 @@ function createApp(options = {}) {
     });
     socketAction('student:fullscreen_exited', () => {
       const s = editableStudent(); if (!s || !s.inFullscreen) return;
-      s.inFullscreen = false; s.outOfFullscreenSince ||= Date.now();
+      s.inFullscreen = false; s.outOfFullscreenSince ||= clock();
       addViolation(s, 'fullscreen_exit', 'Exited fullscreen mode'); persist(); broadcast();
     });
     socketAction('student:violation', data => {
       const s = editableStudent(); if (!s || typeof data.type !== 'string' || typeof data.details !== 'string') return;
       const last = s.violations.at(-1);
-      if (last?.type === data.type && Date.now() - new Date(last.timestamp).getTime() < 1000) return;
+      if (last?.type === data.type && clock() - new Date(last.timestamp).getTime() < 1000) return;
       addViolation(s, data.type.slice(0, 60), data.details.slice(0, 500)); persist(); broadcast();
     });
     socketAction('student:save_answer', (data, ack) => {
@@ -353,7 +444,7 @@ function createApp(options = {}) {
     });
     socketAction('student:submit_exam', (data, ack) => {
       const s = currentStudent(); if (!s) return ack({ success: false, error: 'Join the assessment first' });
-      if (examState.status === 'active' && Date.now() >= examState.endTime) conclude('The assessment time has completed.');
+      reconcileExamTiming();
       if (s.status !== 'submitted') {
         if (examState.status !== 'active' || !validAnswers(data.answers || {})) return ack({ success: false, error: 'Invalid submission or assessment closed' });
         s.answers = { ...s.answers, ...data.answers }; finishStudent(s); persist(); archive('Candidate submission'); broadcast();
@@ -364,7 +455,7 @@ function createApp(options = {}) {
     socket.on('disconnect', () => {
       const s = currentStudent(); if (!s) return;
       s.connected = false; s.inFullscreen = false;
-      if (s.status !== 'submitted') { s.status = 'disconnected'; if (examState.status === 'active') s.outOfFullscreenSince ||= Date.now(); }
+      if (s.status !== 'submitted') { s.status = 'disconnected'; if (examState.status === 'active') s.outOfFullscreenSince ||= clock(); }
       try { persist(); archive('Candidate disconnected'); } catch (error) { console.error(error.message); }
       broadcast();
     });
@@ -379,7 +470,8 @@ function createApp(options = {}) {
   }
   const ticker = setInterval(() => {
     try {
-      if (examState.status === 'active' && Date.now() >= examState.endTime) conclude('The assessment time has completed.');
+      if (!initialized || savingExam) return;
+      reconcileExamTiming();
       if (examState.status === 'active') broadcast();
     } catch (error) { console.error(error.message); }
   }, 2000);
@@ -390,10 +482,10 @@ function createApp(options = {}) {
   }, 60000);
   async function close() {
     clearInterval(ticker); clearInterval(expiryTimer); clearTimeout(archiveTimer);
-    persist(); if (examState.sessionId) archive('Server shutdown');
+    if (initialized) { persist(); if (examState.sessionId) archive('Server shutdown'); }
     await new Promise(resolve => io.close(resolve));
   }
-  return { app, server, close };
+  return { app, server, close, ready };
 }
 if (require.main === module) {
   const instance = createApp(), port = Number(process.env.PORT) || 3000;

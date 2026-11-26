@@ -21,6 +21,27 @@ Open `http://localhost:3000`, `/teacher.html` or `/student.html`. Set environmen
 4. The console shows connected candidates, fullscreen state, live time away, answer counts, flags, answer sheets and audit logs. Answer review reads the synchronized in-memory roster. The examiner may force submission or conclude the exam.
 5. The server finalizes saved answers when the deadline passes, including disconnected candidates. Submission success appears only after server acknowledgement. A new assessment uses a new session identifier so previous drafts and candidates do not carry over.
 
+## Scheduled exams on sleeping Render services (no database)
+
+The teacher can set **Scheduled Start** in the configuration form and save the PDF. The field uses the teacher's device timezone and is sent as an absolute UTC timestamp. Leaving it blank keeps manual start available. Changing the future time reschedules the exam; clearing it cancels automatic start. **Start Now Instead** overrides the schedule explicitly.
+
+The original start/end window is always preserved. For example, an exam scheduled 10–11 AM opens with 40 minutes remaining when a student wakes Render at 10:20 AM. A first wake at or after 11 AM shows an ended exam. Before 10 AM, candidates enter the waiting room. The server checks timestamps at startup, on API requests, on candidate connections and while running; it does not rely on executing a timer while Render is asleep.
+
+Free Render erases uploaded files on sleep. To preserve both the schedule and its question paper without a database, the app can save an **AES-256-GCM encrypted bundle** in the existing GitHub repository on a separate `proctorlock-exams` branch. A new instance restores that bundle and PDF before accepting students. The teacher does not need to return or keep a browser open. Only assessment configuration and the PDF go to this branch; student identities, answers and audit logs are excluded. The existing history/browser-backup limitations below still apply to candidate records.
+
+One-time setup in Render's **Environment** settings:
+
+1. Create a fine-grained GitHub token limited to `MonishVinay/exam_gen`, with repository **Contents: Read and write**. Store it as `EXAM_STORAGE_TOKEN` in Render, never in source control or browser code.
+2. Render supplies the repository slug automatically. To override it, set `EXAM_STORAGE_REPO=MonishVinay/exam_gen`.
+3. Encryption uses the existing stable `SESSION_SECRET`. Optionally set a separate `EXAM_STORAGE_KEY` of at least 24 random characters. Keep this key unchanged while saved exams must remain recoverable; changing it makes the existing encrypted bundle unreadable.
+4. Keep Render deploying from `main`. The app creates and updates only the separate data branch. Saving an exam waits for GitHub confirmation before reporting success. An expired token, unavailable repository or write conflict reports failure rather than claiming an exam is safely scheduled.
+
+No database, paid disk, always-running cron or keep-alive service is required with this setup. GitHub access and the stable encryption key are required on each cold start. GitHub rate/storage limits still apply; this storage is intended for occasional exam configuration changes, not answer-by-answer writes. Git retains older encrypted file versions, so deleting an exam from history does not purge those versions. Only one current/upcoming exam is supported, matching the existing app's single-exam model.
+
+On Render, scheduling is rejected until this external storage is configured, so a local-only save is never presented as sleep-safe. Existing manual exams remain available. The console displays storage readiness after sign-in. Locally, file-backed schedules can be tested without GitHub but depend on the files remaining available.
+
+References: [Render free-tier persistence](https://render.com/docs/free), [GitHub repository contents API](https://docs.github.com/en/rest/repos/contents), [GitHub token setup](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens).
+
 Candidates resume using the same browser and normalized roll number. A per-session resume token prevents another browser from claiming an existing candidate's record. Keep browser storage available; reconnect from the original browser. An examiner can clear the roster after archiving, but clearing does not erase candidate registration or submission history for the same assessment.
 
 ## Integrity monitoring
@@ -47,6 +68,10 @@ Optional storage variables:
 | `DATA_DIR` | `./data` | History and active snapshots |
 | `UPLOADS_DIR` | `./uploads` | Uploaded question papers |
 | `NODE_ENV` | Unset | Use `production` behind Render HTTPS for secure cookies |
+| `EXAM_STORAGE_TOKEN` | Unset | GitHub token for encrypted schedule/PDF storage; required for scheduling on Render free tier |
+| `EXAM_STORAGE_REPO` | Render's repository slug | Repository used for encrypted assessment bundles |
+| `EXAM_STORAGE_KEY` | `SESSION_SECRET` | Stable encryption key, at least 24 characters |
+| `EXAM_STORAGE_BRANCH` | `proctorlock-exams` | Separate data branch; must not be the deployment/default branch |
 
 For a separately configured Render persistent disk, point `DATA_DIR` and `UPLOADS_DIR` at subdirectories of its mount path. This project does not provision a paid disk automatically. File storage and session state support one service instance; do not scale replicas without a shared database/session store. Tailwind, Font Awesome and PDF.js currently load from CDNs, so client internet access is required.
 
@@ -65,3 +90,5 @@ npm audit
 ```
 
 Tests cover REST/WebSocket authentication and logout, PDF/limit validation, waiting candidates, token-protected PDFs, reconnect and restart recovery, immutable submissions, archival before reset, repeated exam isolation, expiry recovery, backup merging, large backups, safe CSV export, corruption recovery and deletion. Client tests run in jsdom entirely in the terminal, with no desktop or browser input; they cover draft isolation, escaped answers/roster text, acknowledgement-based submission, sensor registration, browser-backup recovery and synchronous answer review.
+
+Scheduling tests simulate a fresh empty disk, student-only wake before/during/after the original exam window, cancellation, early conclusion, validation, remote storage failure, encryption integrity and GitHub branch isolation. GitHub API calls are mocked for automated tests; enabling the production token and verifying a real Render cold start are separate deployment steps.

@@ -101,3 +101,34 @@ test('teacher answer review uses memory and roster text cannot create injected h
   assert.equal(p.w.document.getElementById('answers-modal').classList.contains('hidden'), false);
   assert.equal(p.w.document.getElementById('answers-modal-student-name').textContent, "<img src=x onerror=alert(1)>'s Answer Sheet");
 });
+
+test('teacher schedule uses an absolute timezone-aware timestamp and displays its fixed window', async t => {
+  let savedStart;
+  const p = page(t, 'teacher', w => {
+    w.fetch = async (url, options) => {
+      if (url === '/api/teacher/exam') {
+        savedStart = options.body.get('scheduledStartTime');
+        return { json: async () => ({ success: true, examState: { ...exam, status: 'scheduled', durationMinutes: 60, scheduledStartTime: Date.parse(savedStart) } }) };
+      }
+      return { json: async () => ({ authenticated: false }) };
+    };
+  });
+  const localDate = '2030-01-15T10:00';
+  p.w.document.getElementById('exam-scheduled-start-input').value = localDate;
+  p.w.document.getElementById('exam-config-form').dispatchEvent(new p.w.Event('submit', { cancelable: true }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(savedStart, new p.w.Date(localDate).toISOString());
+  assert.equal(p.w.document.getElementById('exam-status-badge').textContent, 'Scheduled');
+  assert.equal(p.w.document.getElementById('start-exam-btn').textContent, 'Start Now Instead');
+  assert.match(p.w.document.getElementById('exam-schedule-help').textContent, /end time stays fixed/);
+});
+
+test('scheduled candidates see the start/end window while waiting and unjoined sockets cannot launch an exam', t => {
+  const p = page(t, 'student');
+  p.eval(`initStudentSocket('Alex', 'R1', 'TEST');`);
+  p.handlers.get('exam:started')(exam);
+  assert.equal(p.w.document.getElementById('permission-screen').classList.contains('hidden'), true);
+  p.eval(`currentExamState = ${JSON.stringify({ ...exam, status: 'scheduled', durationMinutes: 60, scheduledStartTime: Date.parse('2030-01-15T10:00:00Z') })}; currentStudent = ${JSON.stringify(candidate)}; showWaitingScreen();`);
+  assert.equal(p.w.document.getElementById('waiting-heading').textContent, 'Waiting for Scheduled Start');
+  assert.match(p.w.document.getElementById('waiting-start-details').textContent, /Starts .*Ends /);
+});

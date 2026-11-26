@@ -17,10 +17,10 @@ function event(socket, name) {
 function ack(socket, name, value) {
   return new Promise((resolve, reject) => socket.timeout(5000).emit(name, value, (error, data) => error ? reject(error) : resolve(data)));
 }
-async function harness(t, root) {
+async function harness(t, root, options = {}) {
   root ||= fs.mkdtempSync(path.join(os.tmpdir(), 'proctorlock-test-'));
   const dataDir = path.join(root, 'data'), uploadsDir = path.join(root, 'uploads');
-  const instance = createApp({ dataDir, uploadsDir, password: 'test-secret' });
+  const instance = createApp({ dataDir, uploadsDir, password: 'test-secret', ...options });
   await new Promise(resolve => instance.server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${instance.server.address().port}`;
   const sockets = [];
@@ -199,4 +199,115 @@ test('atomic replicas recover corrupted master and deletion survives startup', (
   assert.equal(createStorage(root).history()[0].students[0].answers[1], 'kept');
   storage.delete('exam-one'); assert.deepEqual(createStorage(root).history(), []);
   assert.equal(fs.readdirSync(root).some(f => f.endsWith('.tmp')), false);
+});
+
+function memoryScheduleStore() {
+  const { encryptSchedule, decryptSchedule } = require('../lib/schedule-store');
+  let encrypted = null;
+  const secret = 'a-stable-test-encryption-key-for-scheduling';
+  return {
+    provider: 'github', fail: false,
+    async load() { return encrypted ? decryptSchedule(encrypted, secret) : null; },
+    async save(state, paper) {
+      if (this.fail) throw new Error('Simulated storage outage');
+      encrypted = encryptSchedule(state, paper, secret);
+    }
+  };
+}
+
+test('scheduled exam survives a completely empty Render disk and a student wakes it within the original window', async t => {
+  const start = Date.parse('2030-01-15T10:00:00+05:30');
+  const scheduleStore = memoryScheduleStore();
+  const teacher = await harness(t, undefined, { now: () => start - 3600000, scheduleStore });
+  await teacher.login();
+  const configured = await teacher.configure({ scheduledStartTime: new Date(start).toISOString() });
+  assert.equal(configured.res.status, 200); assert.equal(configured.data.examState.status, 'scheduled');
+  const id = configured.data.examState.sessionId;
+  await teacher.close();
+  // New root means no history, active snapshot or uploaded PDF survived. No teacher logs in.
+  const studentWake = await harness(t, undefined, { now: () => start + 20 * 60000, scheduleStore });
+  assert.notEqual(studentWake.root, teacher.root);
+  const state = (await (await studentWake.request('/api/exam/state')).json()).examState;
+  assert.equal(state.sessionId, id); assert.equal(state.status, 'active');
+  assert.equal(state.startTime, start); assert.equal(state.endTime, start + 3600000);
+  const candidate = await join(studentWake);
+  assert.equal(candidate.payload.student.status, 'in_test');
+  assert.equal(candidate.payload.serverTime, start + 20 * 60000);
+  const paper = await fetch(studentWake.base + state.pdfUrl + '?token=' + candidate.payload.student.resumeToken);
+  assert.equal(paper.status, 200);
+  assert.equal(Buffer.from(await paper.arrayBuffer()).subarray(0, 5).toString(), '%PDF-');
+});
+
+test('waking before a scheduled exam keeps candidates waiting; the first due request starts it exactly once', async t => {
+  const start = Date.parse('2030-01-15T04:30:00Z');
+  let now = start - 3600000;
+  const scheduleStore = memoryScheduleStore();
+  const h = await harness(t, undefined, { now: () => now, scheduleStore }); await h.login();
+  assert.equal((await h.configure({ scheduledStartTime: new Date(start).toISOString() })).res.status, 200);
+  const candidate = await join(h); assert.equal(candidate.payload.student.status, 'waiting');
+  assert.equal((await ack(candidate.socket, 'student:save_answer', { questionNumber: 1, answer: 'too early' })).success, false);
+  let starts = 0; candidate.socket.on('exam:started', () => { starts++; });
+  const started = event(candidate.socket, 'exam:started'); now = start + 1234;
+  const state = (await (await h.request('/api/exam/state')).json()).examState;
+  assert.equal((await started).startTime, start); assert.equal(state.status, 'active');
+  await h.request('/api/exam/state'); assert.equal(starts, 1);
+  assert.equal((await ack(candidate.socket, 'student:save_answer', { questionNumber: 1, answer: 'now allowed' })).success, true);
+});
+
+test('first wake after the scheduled end closes the exam instead of granting a fresh duration', async t => {
+  const start = Date.parse('2030-01-15T04:30:00Z'), scheduleStore = memoryScheduleStore();
+  const teacher = await harness(t, undefined, { now: () => start - 3600000, scheduleStore }); await teacher.login();
+  await teacher.configure({ scheduledStartTime: new Date(start).toISOString() }); await teacher.close();
+  const lateWake = await harness(t, undefined, { now: () => start + 3600000, scheduleStore });
+  const state = (await (await lateWake.request('/api/exam/state')).json()).examState;
+  assert.equal(state.status, 'ended'); assert.equal(state.endTime, start + 3600000);
+  const socket = await lateWake.connect(), denied = event(socket, 'student:join_error');
+  socket.emit('student:join', { name: 'Late', rollNo: 'L1', examCode: 'TEST' });
+  assert.match((await denied).message, /ended/);
+});
+
+test('schedule validation, authentication and missing cloud storage cannot silently create unsafe schedules', async t => {
+  const h = await harness(t); await h.login();
+  assert.equal((await h.configure({ scheduledStartTime: 'not-a-time' })).res.status, 400);
+  assert.equal((await h.configure({ scheduledStartTime: '2020-01-01T10:00:00Z' })).res.status, 400);
+  assert.equal((await h.configure({ scheduledStartTime: '2030-01-15T10:00' })).res.status, 400);
+  const cloud = await harness(t, undefined, { requireDurableSchedules: true }); await cloud.login();
+  const result = await cloud.configure({ scheduledStartTime: '2030-01-15T10:00:00Z' });
+  assert.equal(result.res.status, 503); assert.match(result.data.error, /GitHub/);
+  assert.equal((await cloud.request('/api/teacher/schedule-storage')).status, 200);
+  assert.equal((await fetch(cloud.base + '/api/teacher/schedule-storage')).status, 401);
+  assert.equal((await cloud.configure()).res.status, 200); // Manual exams remain available without extra storage.
+});
+
+test('failed durable save keeps the previous schedule and reports failure to the teacher', async t => {
+  const start = Date.parse('2030-01-15T04:30:00Z'), scheduleStore = memoryScheduleStore();
+  const h = await harness(t, undefined, { now: () => start - 3600000, scheduleStore }); await h.login();
+  await h.configure({ scheduledStartTime: new Date(start).toISOString() });
+  scheduleStore.fail = true;
+  const changed = await h.configure({ title: 'Should not save', scheduledStartTime: new Date(start + 3600000).toISOString() });
+  assert.equal(changed.res.status, 503);
+  const state = (await (await h.request('/api/exam/state')).json()).examState;
+  assert.equal(state.title, 'Algorithms'); assert.equal(state.scheduledStartTime, start);
+  assert.equal(fs.readdirSync(h.uploadsDir).length, 1);
+});
+
+test('rescheduling and cancelling survive disk loss; early conclusion never reopens on the next wake', async t => {
+  const start = Date.parse('2030-01-15T04:30:00Z'), scheduleStore = memoryScheduleStore();
+  let now = start - 3600000;
+  const h = await harness(t, undefined, { now: () => now, scheduleStore }); await h.login();
+  await h.configure({ scheduledStartTime: new Date(start).toISOString() });
+  await h.configure({ scheduledStartTime: '' }); await h.close();
+  now = start + 600000;
+  const wake = await harness(t, undefined, { now: () => now, scheduleStore });
+  assert.equal((await (await wake.request('/api/exam/state')).json()).examState.status, 'created');
+  await wake.login(); await wake.request('/api/teacher/exam/start', { method: 'POST' });
+  await wake.request('/api/teacher/exam/end', { method: 'POST' }); await wake.close();
+  const again = await harness(t, undefined, { now: () => now + 60000, scheduleStore });
+  assert.equal((await (await again.request('/api/exam/state')).json()).examState.status, 'ended');
+});
+
+test('unavailable remote recovery fails closed rather than serving a blank or replaced exam', async t => {
+  const h = await harness(t, undefined, { scheduleStore: { async load() { throw new Error('Network down'); } } });
+  assert.equal((await h.request('/api/exam/state')).status, 503);
+  assert.equal((await h.request('/api/health')).status, 503);
 });

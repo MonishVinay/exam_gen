@@ -21,6 +21,8 @@ const examDurationInput = document.getElementById('exam-duration-input');
 const examQuestionsInput = document.getElementById('exam-questions-input');
 const examCodeInput = document.getElementById('exam-code-input');
 const examPdfFile = document.getElementById('exam-pdf-file');
+const examScheduledStartInput = document.getElementById('exam-scheduled-start-input');
+const examScheduleHelp = document.getElementById('exam-schedule-help');
 const currentPdfStatus = document.getElementById('current-pdf-status');
 const startExamBtn = document.getElementById('start-exam-btn');
 const endExamBtn = document.getElementById('end-exam-btn');
@@ -124,6 +126,19 @@ function showDashboard() {
   initSocket();
   fetchExamState();
   fetchExamHistory();
+  fetchScheduleStorage();
+}
+
+async function fetchScheduleStorage() {
+  const status = document.getElementById('exam-storage-status');
+  if (!status) return;
+  try {
+    const response = await fetch('/api/teacher/schedule-storage');
+    if (!response.ok) throw new Error('Unable to check schedule storage');
+    const data = await response.json();
+    status.textContent = data.message;
+    status.className = `text-xs mt-2 ${data.sleepSafe ? 'text-emerald-400' : 'text-amber-300'}`;
+  } catch { status.textContent = 'Unable to check sleep-safe scheduling. Check your connection before scheduling an exam.'; }
 }
 
 // Teacher Login
@@ -243,6 +258,19 @@ function updateExamUI(state) {
   }
   examCodeInput.value = state.examCode || 'EXAM101';
   displayShareCode.textContent = state.examCode || 'EXAM101';
+  if (examScheduledStartInput) {
+    if (state.scheduledStartTime) {
+      const date = new Date(state.scheduledStartTime);
+      const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+      examScheduledStartInput.value = local.toISOString().slice(0, 16);
+    } else examScheduledStartInput.value = '';
+  }
+  if (examScheduleHelp) {
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    examScheduleHelp.textContent = state.scheduledStartTime
+      ? `Scheduled: ${new Date(state.scheduledStartTime).toLocaleString()} – ${new Date(state.scheduledStartTime + state.durationMinutes * 60000).toLocaleString()} (${zone}). The end time stays fixed if the server wakes late.`
+      : `Leave blank to start manually. Times use ${zone}. The original end time stays fixed even if the server wakes late.`;
+  }
 
   if (state.pdfFileName) {
     currentPdfStatus.textContent = state.pdfFileName;
@@ -263,12 +291,22 @@ function updateExamUI(state) {
     endExamBtn.classList.remove('hidden');
 
     startExamCountdown(state.endTime);
+  } else if (state.status === 'scheduled') {
+    examStatusBadge.className = 'text-[11px] px-2.5 py-0.5 rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/30';
+    examStatusBadge.textContent = 'Scheduled';
+    currentExamMeta.textContent = `${state.title} (${state.examCode}) • Starts ${new Date(state.scheduledStartTime).toLocaleString()} • ${state.durationMinutes} mins`;
+    startExamBtn.classList.remove('hidden');
+    startExamBtn.textContent = 'Start Now Instead';
+    endExamBtn.classList.add('hidden');
+    liveTimerContainer.classList.add('hidden');
+    clearInterval(examCountdownInterval);
   } else if (state.status === 'created') {
     examStatusBadge.className = 'text-[11px] px-2.5 py-0.5 rounded-full bg-blue-500/20 text-blue-400 border border-blue-500/30';
     examStatusBadge.textContent = 'Ready to Start';
     currentExamMeta.textContent = `${state.title} (${state.examCode}) • ${questionsCount} Qs • PDF Loaded`;
     
     startExamBtn.classList.remove('hidden');
+    startExamBtn.textContent = 'Start Exam for Students';
     endExamBtn.classList.add('hidden');
     liveTimerContainer.classList.add('hidden');
     clearInterval(examCountdownInterval);
@@ -329,6 +367,14 @@ examConfigForm.addEventListener('submit', async (e) => {
   formData.append('durationMinutes', examDurationInput.value);
   formData.append('totalQuestions', examQuestionsInput.value);
   formData.append('examCode', examCodeInput.value);
+  if (examScheduledStartInput?.value) {
+    const scheduled = new Date(examScheduledStartInput.value);
+    if (!Number.isFinite(scheduled.getTime()) || scheduled <= new Date()) {
+      alert('Choose a future scheduled start time.');
+      return;
+    }
+    formData.append('scheduledStartTime', scheduled.toISOString());
+  }
 
   if (examPdfFile.files.length > 0) {
     formData.append('examPdf', examPdfFile.files[0]);
@@ -347,7 +393,7 @@ examConfigForm.addEventListener('submit', async (e) => {
     const data = await res.json();
     if (data.success) {
       updateExamUI(data.examState);
-      alert('Exam details and PDF saved successfully!');
+      alert(data.examState.status === 'scheduled' ? 'Exam scheduled successfully. Its original start/end window will be kept.' : 'Exam details and PDF saved successfully!');
     } else {
       alert(`Error: ${data.error}`);
     }
