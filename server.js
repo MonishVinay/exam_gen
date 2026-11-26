@@ -202,8 +202,8 @@ function createApp(options = {}) {
   app.get('/api/teacher/schedule-storage', requireTeacher, (req, res) => res.json({
     sleepSafe: !!scheduleStore, provider: scheduleStore?.provider || 'local',
     message: scheduleStore
-      ? 'The schedule and PDF are saved encrypted outside Render. Students can wake the app without the teacher.'
-      : requireDurableSchedules ? 'To schedule exams through Render sleep, configure EXAM_STORAGE_TOKEN, EXAM_STORAGE_REPO and a stable EXAM_STORAGE_KEY in Render. No database is needed.'
+      ? 'Encrypted GitHub storage is connected. Saving an exam will preserve its schedule and PDF through Render sleep.'
+      : requireDurableSchedules ? 'EXAM_STORAGE_TOKEN is not detected by this running service. Add it with this exact uppercase name to this Render service, then save and redeploy. The repository and existing SESSION_SECRET are used automatically; no extra tokens are needed.'
         : 'Local schedules survive restarts only while these files remain available. Configure GitHub storage before using Render free tier.'
   }));
   app.post('/api/teacher/logout', (req, res, next) => {
@@ -240,7 +240,7 @@ function createApp(options = {}) {
     if (scheduledStartTime && (!Number.isFinite(scheduled) || !/[zZ]$|[+-]\d{2}:\d{2}$/.test(scheduledStartTime) || scheduled <= clock())) return reject('Choose a future scheduled start time with a timezone.');
     if (scheduled && requireDurableSchedules && !scheduleStore) {
       if (req.file) fs.unlinkSync(req.file.path);
-      return res.status(503).json({ success: false, error: 'Sleep-safe scheduling needs GitHub storage. Configure EXAM_STORAGE_TOKEN, EXAM_STORAGE_REPO and EXAM_STORAGE_KEY in Render. No database is required.' });
+      return res.status(503).json({ success: false, error: 'GitHub storage is not enabled: this running service has no EXAM_STORAGE_TOKEN. Add that exact environment variable to this Render service and redeploy. The repository and existing SESSION_SECRET are used automatically.' });
     }
     if (req.file) {
       const fd = fs.openSync(req.file.path, 'r'), header = Buffer.alloc(5);
